@@ -55,6 +55,18 @@ type CreatedCaseView = {
   status: string;
 };
 
+const specialistRoles = ["contract", "operations", "risk", "negotiation"] as const;
+
+// What's actually happening on "Run case team," made visible instead of a
+// black-box spinner. "streaming" is a live run watched in this tab (specialist
+// completions arrive over SSE as they happen). "recovering" is what shows if
+// you reload mid-run: the original stream is gone, but the run kept going on
+// the server, so this polls until it lands instead of just looking empty.
+type RunState =
+  | { kind: "idle" }
+  | { kind: "streaming"; stage: "specialists" | "synthesizing"; specialists: Record<string, { confidence: number }> }
+  | { kind: "recovering" };
+
 function Glyph({ children }: { children: React.ReactNode }) {
   return <span className="glyph" aria-hidden="true">{children}</span>;
 }
@@ -85,6 +97,51 @@ function roleAvatarClass(role: string) {
   return "contract";
 }
 
+function runButtonLabel(runState: RunState) {
+  if (runState.kind === "recovering") return "Reconnecting…";
+  if (runState.kind === "streaming") {
+    return runState.stage === "synthesizing" ? "Synthesizing…" : "Analyzing…";
+  }
+  return "Run case team";
+}
+
+/** Parses a fetch Response body shaped as Server-Sent Events. */
+async function consumeEventStream(
+  response: Response,
+  onEvent: (event: string, data: Record<string, unknown>) => void,
+) {
+  if (!response.body) throw new Error("The server did not return a stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let eventName = "message";
+      const dataLines: string[] = [];
+      for (const line of rawEvent.split("\n")) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length === 0) continue;
+      try {
+        onEvent(eventName, JSON.parse(dataLines.join("\n")));
+      } catch {
+        // Ignore a malformed frame rather than aborting the whole stream.
+      }
+    }
+  }
+}
+
 export default function Home() {
   const router = useRouter();
   const [view, setView] = useState<View>("Overview");
@@ -98,7 +155,7 @@ export default function Home() {
   const [storedDocuments, setStoredDocuments] = useState<StoredDocument[]>([]);
   const [draft, setDraft] = useState("");
   const [toast, setToast] = useState("");
-  const [running, setRunning] = useState(false);
+  const [runState, setRunState] = useState<RunState>({ kind: "idle" });
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [runtime, setRuntime] = useState<RuntimeStatus>({
     orchestrator: "LangGraph",
@@ -108,14 +165,62 @@ export default function Home() {
   });
   const [liveAnalysis, setLiveAnalysis] = useState<CaseAnalysis | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const notify = (message: string) => {
     setToast(message);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 2400);
+    toastTimer.current = setTimeout(() => setToast(""), 3600);
+  };
+
+  const stopPolling = () => {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  const pollCase = (caseId: string) => {
+    stopPolling();
+    setRunState({ kind: "recovering" });
+    let attempts = 0;
+    pollTimer.current = setInterval(async () => {
+      attempts += 1;
+      try {
+        const response = await fetch(`/api/cases/${caseId}`);
+        if (response.ok) {
+          const result = await response.json();
+          if (result.runStatus === "completed") {
+            stopPolling();
+            setRunState({ kind: "idle" });
+            if (result.analysis) {
+              setLiveAnalysis(result.analysis);
+              setDraft(result.analysis.draftResponse ?? "");
+              notify("The case analysis finished while you were away");
+            }
+            return;
+          }
+          if (result.runStatus === "failed") {
+            stopPolling();
+            setRunState({ kind: "idle" });
+            notify("The last analysis attempt failed. You can run the case team again.");
+            return;
+          }
+        }
+      } catch {
+        // A transient network hiccup shouldn't stop polling; just retry.
+      }
+      if (attempts >= 90) {
+        stopPolling();
+        setRunState({ kind: "idle" });
+        notify("Still no result after several minutes — you can try running the case team again.");
+      }
+    }, 4000);
   };
 
   const loadCase = async (caseId: string) => {
+    stopPolling();
+    setRunState({ kind: "idle" });
     setLiveAnalysis(null);
     setStoredDocuments([]);
     setDraft("");
@@ -133,6 +238,9 @@ export default function Home() {
         if (caseResult.analysis) {
           setLiveAnalysis(caseResult.analysis);
           setDraft(caseResult.analysis.draftResponse ?? "");
+        }
+        if (caseResult.runStatus === "running") {
+          pollCase(caseId);
         }
       }
     } catch (error) {
@@ -175,13 +283,15 @@ export default function Home() {
 
     return () => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
+      stopPolling();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const runTeam = async () => {
     if (!activeCaseId) return;
-    setRunning(true);
+    stopPolling();
+    setRunState({ kind: "streaming", stage: "specialists", specialists: {} });
 
     try {
       const response = await fetch("/api/cases/analyze", {
@@ -189,26 +299,49 @@ export default function Home() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ caseId: activeCaseId }),
       });
-      const result = await response.json();
 
       if (!response.ok) {
+        const result = await response.json().catch(() => ({}) as { error?: string });
         throw new Error(result.error || "Analysis failed");
       }
 
-      setLiveAnalysis(result.analysis);
-      setDraft(result.analysis.draftResponse ?? "");
-      setSavedCases((current) =>
-        current.map((item) =>
-          item.id === activeCaseId
-            ? { ...item, status: formatCaseStatus("strategy") }
-            : item,
-        ),
-      );
+      let streamError = "";
+
+      await consumeEventStream(response, (event, data) => {
+        if (event === "specialist" && typeof data.role === "string") {
+          const role = data.role;
+          const confidence = typeof data.confidence === "number" ? data.confidence : 0;
+          setRunState((prev) =>
+            prev.kind === "streaming"
+              ? { kind: "streaming", stage: "specialists", specialists: { ...prev.specialists, [role]: { confidence } } }
+              : prev,
+          );
+        } else if (event === "synthesizing") {
+          setRunState((prev) =>
+            prev.kind === "streaming"
+              ? { kind: "streaming", stage: "synthesizing", specialists: prev.specialists }
+              : prev,
+          );
+        } else if (event === "complete" && data.analysis) {
+          const analysis = data.analysis as CaseAnalysis;
+          setLiveAnalysis(analysis);
+          setDraft(analysis.draftResponse ?? "");
+          setSavedCases((current) =>
+            current.map((item) =>
+              item.id === activeCaseId ? { ...item, status: formatCaseStatus("strategy") } : item,
+            ),
+          );
+        } else if (event === "error" && typeof data.error === "string") {
+          streamError = data.error;
+        }
+      });
+
+      if (streamError) throw new Error(streamError);
       notify("LangGraph completed a fresh case analysis");
     } catch (error) {
       notify(error instanceof Error ? error.message : "Analysis failed");
     } finally {
-      setRunning(false);
+      setRunState({ kind: "idle" });
     }
   };
 
@@ -353,6 +486,7 @@ export default function Home() {
     : undefined;
   const hasWorkspace = Boolean(activeCaseId && current);
   const isClosed = current?.status.toLowerCase().includes("closed") ?? false;
+  const analyzing = runState.kind !== "idle";
 
   return (
     <main className="app-shell">
@@ -369,17 +503,16 @@ export default function Home() {
 
         <nav className="main-nav" aria-label="Main navigation">
           <p>WORKSPACE</p>
-          <button onClick={() => notify("Inbox is clear")}><Glyph>⌁</Glyph> Inbox</button>
           <button className="selected"><Glyph>▣</Glyph> Cases</button>
-          <button onClick={() => notify("Playbooks will learn from every outcome")}><Glyph>⌘</Glyph> Playbooks</button>
-          <button onClick={() => notify("Knowledge base is connected to this case")}><Glyph>◇</Glyph> Knowledge</button>
-          <button onClick={() => notify("Outcomes tracks recovered value")}><Glyph>↗</Glyph> Outcomes</button>
+          <button className="soon" title="Not built yet" onClick={() => notify("Inbox isn't built yet — cases are the only workspace object right now.")}><Glyph>⌁</Glyph> Inbox<span className="soon-tag">Soon</span></button>
+          <button className="soon" title="Not built yet" onClick={() => notify("Playbooks isn't built yet — the plan is to turn closed cases into reusable, checkable patterns.")}><Glyph>⌘</Glyph> Playbooks<span className="soon-tag">Soon</span></button>
+          <button className="soon" title="Not built yet" onClick={() => notify("Knowledge isn't built yet — the plan is a shared clause and evidence library across your cases.")}><Glyph>◇</Glyph> Knowledge<span className="soon-tag">Soon</span></button>
+          <button className="soon" title="Not built yet" onClick={() => notify("Outcomes isn't built yet — the plan is to track recovered value and cycle time across closed cases.")}><Glyph>↗</Glyph> Outcomes<span className="soon-tag">Soon</span></button>
         </nav>
 
         <div className="case-list">
           <div className="case-list-title">
             <span>RECENT CASES</span>
-            {savedCases.length > 0 && <button aria-label="More case options">•••</button>}
           </div>
           {savedCases.length === 0 ? (
             <p style={{ padding: "6px 9px", fontSize: 11, lineHeight: 1.5, color: "#7fa094" }}>
@@ -432,9 +565,9 @@ export default function Home() {
                   <i />
                   {runtime.orchestrator} · {runtime.provider}
                 </button>
-                <button className="icon-button" aria-label="Search" onClick={() => notify("Search opened")}>⌕</button>
+                <button className="icon-button" aria-label="Search" onClick={() => notify("Search isn't built yet.")}>⌕</button>
                 <button className="icon-button notification" aria-label="Notifications" onClick={() => notify("You're all caught up")}>♢</button>
-                <button className="run-button" onClick={runTeam} disabled={running}><span>{running ? "◌" : "✦"}</span>{running ? "Analyzing…" : "Run case team"}</button>
+                <button className="run-button" onClick={runTeam} disabled={analyzing}><span>{analyzing ? "◌" : "✦"}</span>{runButtonLabel(runState)}</button>
               </div>
             </header>
 
@@ -453,7 +586,7 @@ export default function Home() {
                 key={activeCaseId}
                 analysis={liveAnalysis}
                 documents={storedDocuments}
-                running={running}
+                runState={runState}
                 onRun={runTeam}
                 goTo={setView}
               />
@@ -470,7 +603,7 @@ export default function Home() {
               <Strategy
                 key={activeCaseId}
                 analysis={liveAnalysis}
-                running={running}
+                runState={runState}
                 onRun={runTeam}
                 goTo={setView}
               />
@@ -483,7 +616,7 @@ export default function Home() {
                 setDraft={setDraft}
                 onCopy={copyDraft}
                 notify={notify}
-                running={running}
+                runState={runState}
                 onRun={runTeam}
               />
             )}
@@ -578,32 +711,79 @@ function EmptyState({
   );
 }
 
+/** The live "what's happening" view: real per-specialist progress while
+ * watching (kind: "streaming"), or a recovery notice after a refresh
+ * (kind: "recovering"). Never shown for kind: "idle". */
+function RunProgress({ runState, compact }: { runState: RunState; compact?: boolean }) {
+  if (runState.kind === "idle") return null;
+
+  if (runState.kind === "recovering") {
+    return (
+      <div className={`run-progress ${compact ? "compact" : ""}`}>
+        <span className="run-progress-spinner" aria-hidden="true">◌</span>
+        <div className="run-progress-body">
+          <strong>Reconnecting to a run already in progress…</strong>
+          <small>You reloaded mid-analysis — the case team kept working on the server. Checking back every few seconds.</small>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`run-progress ${compact ? "compact" : ""}`}>
+      <span className="run-progress-spinner" aria-hidden="true">◌</span>
+      <div className="run-progress-body">
+        <strong>{runState.stage === "synthesizing" ? "Case lead is combining the specialists' work…" : "Four specialists are reading your evidence…"}</strong>
+        <small>Each one works independently, then the case lead resolves any disagreement into one recommendation.</small>
+        <ul className="run-progress-steps">
+          {specialistRoles.map((role) => {
+            const done = Boolean(runState.specialists[role]);
+            return (
+              <li key={role} className={done ? "done" : runState.stage === "specialists" ? "active" : "pending"}>
+                <span>{done ? "✓" : "○"}</span>{roleLabel(role)}
+              </li>
+            );
+          })}
+          <li className={runState.stage === "synthesizing" ? "active" : "pending"}>
+            <span>○</span>Case lead synthesis
+          </li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function Overview({
   analysis,
   documents,
-  running,
+  runState,
   onRun,
   goTo,
 }: {
   analysis: CaseAnalysis | null;
   documents: StoredDocument[];
-  running: boolean;
+  runState: RunState;
   onRun: () => void;
   goTo: (v: View) => void;
 }) {
   const [done, setDone] = useState<Set<number>>(new Set());
+  const analyzing = runState.kind !== "idle";
 
   if (!analysis) {
     return (
       <div className="content-view single-column">
-        <EmptyState
-          icon="✦"
-          title="No strategy yet."
-          body="Run the case team once your evidence is in place. The case lead synthesizes a recommended position, priority actions, and a draft response from what the specialists find in your documents."
-          actionLabel={running ? "Analyzing…" : "Run case team"}
-          onAction={onRun}
-          actionDisabled={running || documents.length === 0}
-        />
+        {analyzing ? (
+          <RunProgress runState={runState} />
+        ) : (
+          <EmptyState
+            icon="✦"
+            title="No strategy yet."
+            body="Run the case team once your evidence is in place. The case lead synthesizes a recommended position, priority actions, and a draft response from what the specialists find in your documents."
+            actionLabel="Run case team"
+            onAction={onRun}
+            actionDisabled={documents.length === 0}
+          />
+        )}
       </div>
     );
   }
@@ -619,7 +799,7 @@ function Overview({
   const readyDocs = documents.filter((document) => document.extractionStatus === "ready").length;
   const risks = analysis.specialistOutputs.flatMap((specialist) => specialist.risks);
   const team = [
-    { role: "lead", label: "Case lead", note: "Synthesized the team's position", confidence: analysis.confidence },
+    { role: "lead", label: "Case lead", note: "Combined the specialists' work into one recommendation", confidence: analysis.confidence },
     ...analysis.specialistOutputs.map((specialist) => ({
       role: specialist.role,
       label: roleLabel(specialist.role),
@@ -627,16 +807,19 @@ function Overview({
       confidence: specialist.confidence,
     })),
   ];
+  const positionIsLong = analysis.recommendedPosition.length > 90;
 
   return (
     <div className="overview-grid content-view">
       <div className="overview-main">
+        {analyzing && <RunProgress runState={runState} compact />}
         <section className="hero-card no-visual">
           <div className="hero-copy">
             <div className="section-kicker"><span>✦</span> CASE TEAM RECOMMENDATION</div>
-            <h2>{analysis.recommendedPosition}</h2>
+            <h2 className={positionIsLong ? "long" : ""}>{analysis.recommendedPosition}</h2>
             <p>{analysis.executiveSummary}</p>
             <div className="confidence"><span>CONFIDENCE</span><div><i style={{ width: `${Math.round(analysis.confidence * 100)}%` }} /></div><strong>{Math.round(analysis.confidence * 100)}%</strong><small>{analysis.confidence >= .75 ? "High" : "Review"}</small></div>
+            <p className="confidence-note">How sure the case team is in this specific recommendation, based only on the evidence you gave it — not a guarantee of outcome.</p>
             <div className="hero-buttons">
               <button className="primary" onClick={() => goTo("Strategy")}>View full strategy <span>→</span></button>
               <button onClick={() => goTo("Drafts")}><span>✎</span> Draft response</button>
@@ -671,6 +854,7 @@ function Overview({
       <aside className="insight-rail">
         <section className="team-card">
           <div className="rail-heading"><div><span className="live-dot" />CASE TEAM</div></div>
+          <p className="rail-note">Four AI specialists independently review your evidence from different angles; the case lead resolves any disagreement into one recommendation. The percentage is each one&apos;s confidence in their own findings.</p>
           <div className="agent-list">
             {team.map((member) => (
               <div key={member.role}>
@@ -685,6 +869,7 @@ function Overview({
         {analysis.evidenceGaps.length > 0 && (
           <section className="argument-card">
             <div className="rail-heading"><div>EVIDENCE GAPS</div></div>
+            <p className="rail-note">Things the case team couldn&apos;t verify from what you uploaded — closing these strengthens the position.</p>
             <div className="argument-flow">
               {analysis.evidenceGaps.slice(0, 3).map((gap, index) => (
                 <div className="proof-needed" key={index}><span>GAP {index + 1}</span><p>{gap}</p></div>
@@ -784,26 +969,31 @@ function formatCaseStatus(status: string) {
 
 function Strategy({
   analysis,
-  running,
+  runState,
   onRun,
   goTo,
 }: {
   analysis: CaseAnalysis | null;
-  running: boolean;
+  runState: RunState;
   onRun: () => void;
   goTo: (v: View) => void;
 }) {
+  const analyzing = runState.kind !== "idle";
+
   if (!analysis) {
     return (
       <div className="content-view single-column">
-        <EmptyState
-          icon="⌘"
-          title="No positions to compare yet."
-          body="Once the case team runs, you'll see the recommended position scored against every alternative it considered."
-          actionLabel={running ? "Analyzing…" : "Run case team"}
-          onAction={onRun}
-          actionDisabled={running}
-        />
+        {analyzing ? (
+          <RunProgress runState={runState} />
+        ) : (
+          <EmptyState
+            icon="⌘"
+            title="No positions to compare yet."
+            body="Once the case team runs, you'll see the recommended position scored against every alternative it considered."
+            actionLabel="Run case team"
+            onAction={onRun}
+          />
+        )}
       </div>
     );
   }
@@ -816,10 +1006,11 @@ function Strategy({
         <div>
           <span className="section-kicker"><b>⌘</b> POSITION DESIGN</span>
           <h2>The recommended position, and what else the team weighed.</h2>
-          <p>Scored by the case team against the evidence available when it ran.</p>
+          <p>Scored by the case team against the evidence available when it ran. &ldquo;Alternative&rdquo; routes were considered and set aside — read why below before assuming the top choice is the only option.</p>
         </div>
         <button className="solid" onClick={() => goTo("Drafts")}>Draft from strategy →</button>
       </div>
+      {analyzing && <RunProgress runState={runState} compact />}
       <div className="strategy-routes">
         <article className="strategy-route recommended">
           <div className="route-top"><span>RECOMMENDED</span><div className="route-score"><strong>{score}</strong><small>/100</small></div></div>
@@ -832,7 +1023,7 @@ function Strategy({
             <div className="route-top"><span>ALTERNATIVE</span></div>
             <h3>{alternative.name}</h3>
             <p>{alternative.whenToUse}</p>
-            <div className="route-tags"><span>{alternative.tradeoffs}</span></div>
+            <div className="route-tradeoff"><span>TRADEOFF</span>{alternative.tradeoffs}</div>
           </article>
         ))}
       </div>
@@ -849,7 +1040,7 @@ function Strategy({
         <section className="counterparty-card">
           <span>TEAM READ</span>
           <h3>How confident each specialist is.</h3>
-          <p>Confidence and risk count from each independent specialist pass.</p>
+          <p>Confidence and risk count from each independent specialist pass — a low number here is a reason to review that angle yourself, not a bug.</p>
           {analysis.specialistOutputs.map((specialist, index) => (
             <div key={index}><span>{roleLabel(specialist.role)}</span><strong>{Math.round(specialist.confidence * 100)}% confidence · {specialist.risks.length} risk{specialist.risks.length === 1 ? "" : "s"} flagged</strong></div>
           ))}
@@ -865,7 +1056,7 @@ function Drafts({
   setDraft,
   onCopy,
   notify,
-  running,
+  runState,
   onRun,
 }: {
   analysis: CaseAnalysis | null;
@@ -873,20 +1064,25 @@ function Drafts({
   setDraft: (v: string) => void;
   onCopy: () => void;
   notify: (m: string) => void;
-  running: boolean;
+  runState: RunState;
   onRun: () => void;
 }) {
+  const analyzing = runState.kind !== "idle";
+
   if (!analysis) {
     return (
       <div className="content-view single-column">
-        <EmptyState
-          icon="✎"
-          title="No draft yet."
-          body="A draft response is generated from the case team's approved strategy, with every factual claim checked against your evidence."
-          actionLabel={running ? "Analyzing…" : "Run case team"}
-          onAction={onRun}
-          actionDisabled={running}
-        />
+        {analyzing ? (
+          <RunProgress runState={runState} />
+        ) : (
+          <EmptyState
+            icon="✎"
+            title="No draft yet."
+            body="A draft response is generated from the case team's approved strategy, with every factual claim checked against your evidence."
+            actionLabel="Run case team"
+            onAction={onRun}
+          />
+        )}
       </div>
     );
   }
@@ -902,10 +1098,10 @@ function Drafts({
       <section className="editor-card">
         <header>
           <div><span>DRAFT RESPONSE</span><h2>Response drafted by the case team</h2></div>
-          <div><button onClick={onCopy}>Copy</button><button className="send" onClick={() => notify("Export options opened")}>Export ↗</button></div>
+          <div><button onClick={onCopy}>Copy</button><button className="send" onClick={() => notify("Export isn't built yet — copy the text for now.")}>Export ↗</button></div>
         </header>
         <textarea aria-label="Draft response" value={draft} onChange={(e) => setDraft(e.target.value)} />
-        <footer><div><span className="quality-dot" />Drafted from the approved strategy</div><span>{wordCount} words</span></footer>
+        <footer><div><span className="quality-dot" />Drafted from the approved strategy — read it before sending; nothing is sent for you</div><span>{wordCount} words</span></footer>
       </section>
       <aside className="draft-guidance">
         <div className="rail-heading"><div>WRITER NOTES</div></div>

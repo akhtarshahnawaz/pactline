@@ -82,6 +82,7 @@ const synthesize = task(
           "Synthesize the specialist work into one defensible strategy. Resolve contradictions explicitly, prefer evidence over confidence, preserve material uncertainty, and never manufacture facts.",
           "The draft response must be professional, concise, editable, and must not promise terms or authority that the case brief does not grant.",
           "Return all specialist outputs unchanged in specialistOutputs so the user can audit the recommendation.",
+          "Field length rules, because these render as compact UI elements, not paragraphs: recommendedPosition is a single headline sentence under 18 words naming the position — put every condition, mechanism, and next step in executiveSummary or priorityActions instead, never in recommendedPosition. Each priorityActions.timing is a short label of 2-4 words (e.g. 'Today', 'Within 48h', 'This week') — any condition or nuance about timing belongs in that action's reason, not in timing. Each alternatives.tradeoffs is one short phrase under 12 words.",
         ].join(" "),
       ),
       new HumanMessage(

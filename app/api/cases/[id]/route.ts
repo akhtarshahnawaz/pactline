@@ -19,8 +19,19 @@ export async function GET(request: Request, context: RouteContext) {
     return Response.json({ error: "Case not found" }, { status: 404 });
   }
 
+  // The most recent run of any status, so a client that reloads mid-run can
+  // detect "still running" and reconnect instead of showing a blank slate.
   const [latestRun] = await db
-    .select({ result: agentRun.result, completedAt: agentRun.completedAt })
+    .select({ status: agentRun.status })
+    .from(agentRun)
+    .where(eq(agentRun.caseId, id))
+    .orderBy(desc(agentRun.startedAt))
+    .limit(1);
+
+  // Separately, the most recent *completed* run's result — kept independent
+  // of the query above so a failed re-run doesn't hide a previous success.
+  const [latestCompleted] = await db
+    .select({ result: agentRun.result })
     .from(agentRun)
     .where(and(eq(agentRun.caseId, id), eq(agentRun.status, "completed")))
     .orderBy(desc(agentRun.completedAt))
@@ -28,6 +39,7 @@ export async function GET(request: Request, context: RouteContext) {
 
   return Response.json({
     case: ownedCase,
-    analysis: latestRun?.result ?? null,
+    analysis: latestCompleted?.result ?? null,
+    runStatus: latestRun?.status ?? null,
   });
 }
