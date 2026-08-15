@@ -1,0 +1,49 @@
+{
+  "name": "pactline",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0 --port ${PORT:-3000}",
+    "test": "npm run typecheck && npm run build",
+    "lint": "eslint . --ignore-pattern .next --ignore-pattern dist --ignore-pattern .vinext --ignore-pattern work --ignore-pattern outputs",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "dependencies": {
+    "@better-auth/drizzle-adapter": "^1.6.28",
+    "@langchain/anthropic": "^1.5.5",
+    "@langchain/core": "^1.2.7",
+    "@langchain/langgraph": "^1.4.9",
+    "@langchain/openai": "^1.5.7",
+    "better-auth": "^1.6.28",
+    "drizzle-orm": "0.45.2",
+    "langchain": "^1.5.8",
+    "mammoth": "^1.12.1",
+    "next": "^16.3.1",
+    "pg": "^8.23.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "read-excel-file": "^9.3.10",
+    "unpdf": "^1.8.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/pg": "^8.21.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "^16.3.1",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3"
+  },
+  "type": "module"
+}

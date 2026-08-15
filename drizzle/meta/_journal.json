@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1786716646060,
+      "tag": "0000_military_tigra",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786718558268,
+      "tag": "0001_rapid_payback",
+      "breakpoints": true
+    }
+  ]
+}

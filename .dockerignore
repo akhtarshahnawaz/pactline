@@ -1,0 +1,10 @@
+.git
+.next
+node_modules
+.env*
+!.env.example
+context
+tmp
+work
+outputs
+npm-debug.log*
