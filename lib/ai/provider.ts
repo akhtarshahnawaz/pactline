@@ -111,7 +111,10 @@ export function createChatModel(): BaseChatModel {
   return new ChatOpenAI({
     model: config.model,
     apiKey: config.apiKey,
-    temperature: 0,
+    // Newer OpenAI models (the gpt-5 and o-series reasoning models) reject
+    // any temperature other than their default (1), so it's left unset here
+    // rather than forced to 0. Anthropic models still get temperature: 0
+    // above, since Claude supports it.
     maxRetries: 2,
     configuration:
       config.provider === "openai-compatible"
