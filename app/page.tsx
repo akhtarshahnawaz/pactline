@@ -57,15 +57,20 @@ type CreatedCaseView = {
 
 const specialistRoles = ["contract", "operations", "risk", "negotiation"] as const;
 
+type AskTurn = { question: string; answer: string };
+
 // What's actually happening on "Run case team," made visible instead of a
-// black-box spinner. "streaming" is a live run watched in this tab (specialist
-// completions arrive over SSE as they happen). "recovering" is what shows if
-// you reload mid-run: the original stream is gone, but the run kept going on
-// the server, so this polls until it lands instead of just looking empty.
+// black-box spinner. The server persists progress to the database as each
+// specialist finishes, and this is driven purely by polling GET
+// /api/cases/[id] every few seconds — deliberately not a live stream, since
+// an SSE response never reached the browser in production (something in
+// front of Railway buffers it). Polling is the same plain request/response
+// pattern the rest of this app already relies on, so it isn't at the mercy
+// of infrastructure we don't control. It also means a page reload mid-run
+// recovers into the exact same state instead of losing all trace of it.
 type RunState =
   | { kind: "idle" }
-  | { kind: "streaming"; stage: "specialists" | "synthesizing"; specialists: Record<string, { confidence: number }> }
-  | { kind: "recovering" };
+  | { kind: "running"; stage: "starting" | "specialists" | "synthesizing"; specialists: Record<string, { confidence: number }> };
 
 function Glyph({ children }: { children: React.ReactNode }) {
   return <span className="glyph" aria-hidden="true">{children}</span>;
@@ -98,48 +103,10 @@ function roleAvatarClass(role: string) {
 }
 
 function runButtonLabel(runState: RunState) {
-  if (runState.kind === "recovering") return "Reconnecting…";
-  if (runState.kind === "streaming") {
-    return runState.stage === "synthesizing" ? "Synthesizing…" : "Analyzing…";
-  }
-  return "Run case team";
-}
-
-/** Parses a fetch Response body shaped as Server-Sent Events. */
-async function consumeEventStream(
-  response: Response,
-  onEvent: (event: string, data: Record<string, unknown>) => void,
-) {
-  if (!response.body) throw new Error("The server did not return a stream.");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const rawEvent = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
-
-      let eventName = "message";
-      const dataLines: string[] = [];
-      for (const line of rawEvent.split("\n")) {
-        if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-      }
-      if (dataLines.length === 0) continue;
-      try {
-        onEvent(eventName, JSON.parse(dataLines.join("\n")));
-      } catch {
-        // Ignore a malformed frame rather than aborting the whole stream.
-      }
-    }
-  }
+  if (runState.kind !== "running") return "Run case team";
+  if (runState.stage === "synthesizing") return "Synthesizing…";
+  if (runState.stage === "specialists") return "Analyzing…";
+  return "Starting…";
 }
 
 export default function Home() {
@@ -164,6 +131,10 @@ export default function Home() {
     configured: false,
   });
   const [liveAnalysis, setLiveAnalysis] = useState<CaseAnalysis | null>(null);
+  const [askOpen, setAskOpen] = useState(false);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askHistory, setAskHistory] = useState<AskTurn[]>([]);
+  const [asking, setAsking] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -182,7 +153,7 @@ export default function Home() {
 
   const pollCase = (caseId: string) => {
     stopPolling();
-    setRunState({ kind: "recovering" });
+    setRunState({ kind: "running", stage: "starting", specialists: {} });
     let attempts = 0;
     pollTimer.current = setInterval(async () => {
       attempts += 1;
@@ -196,7 +167,12 @@ export default function Home() {
             if (result.analysis) {
               setLiveAnalysis(result.analysis);
               setDraft(result.analysis.draftResponse ?? "");
-              notify("The case analysis finished while you were away");
+              setSavedCases((current) =>
+                current.map((item) =>
+                  item.id === caseId ? { ...item, status: formatCaseStatus("strategy") } : item,
+                ),
+              );
+              notify("The case team finished the analysis");
             }
             return;
           }
@@ -206,16 +182,32 @@ export default function Home() {
             notify("The last analysis attempt failed. You can run the case team again.");
             return;
           }
+          if (result.runStatus === "running") {
+            const progress = result.runProgress as
+              | { stage?: string; specialists?: Record<string, { confidence: number }> }
+              | null;
+            const specialists = progress?.specialists ?? {};
+            setRunState({
+              kind: "running",
+              stage:
+                progress?.stage === "synthesizing"
+                  ? "synthesizing"
+                  : Object.keys(specialists).length > 0
+                    ? "specialists"
+                    : "starting",
+              specialists,
+            });
+          }
         }
       } catch {
         // A transient network hiccup shouldn't stop polling; just retry.
       }
-      if (attempts >= 90) {
+      if (attempts >= 150) {
         stopPolling();
         setRunState({ kind: "idle" });
         notify("Still no result after several minutes — you can try running the case team again.");
       }
-    }, 4000);
+    }, 2500);
   };
 
   const loadCase = async (caseId: string) => {
@@ -224,6 +216,8 @@ export default function Home() {
     setLiveAnalysis(null);
     setStoredDocuments([]);
     setDraft("");
+    setAskHistory([]);
+    setAskOpen(false);
     try {
       const [documentsResponse, caseResponse] = await Promise.all([
         fetch(`/api/cases/${caseId}/documents`),
@@ -291,7 +285,7 @@ export default function Home() {
   const runTeam = async () => {
     if (!activeCaseId) return;
     stopPolling();
-    setRunState({ kind: "streaming", stage: "specialists", specialists: {} });
+    setRunState({ kind: "running", stage: "starting", specialists: {} });
 
     try {
       const response = await fetch("/api/cases/analyze", {
@@ -299,49 +293,24 @@ export default function Home() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ caseId: activeCaseId }),
       });
+      const result = await response.json().catch(() => ({}) as { error?: string });
 
       if (!response.ok) {
-        const result = await response.json().catch(() => ({}) as { error?: string });
         throw new Error(result.error || "Analysis failed");
       }
 
-      let streamError = "";
-
-      await consumeEventStream(response, (event, data) => {
-        if (event === "specialist" && typeof data.role === "string") {
-          const role = data.role;
-          const confidence = typeof data.confidence === "number" ? data.confidence : 0;
-          setRunState((prev) =>
-            prev.kind === "streaming"
-              ? { kind: "streaming", stage: "specialists", specialists: { ...prev.specialists, [role]: { confidence } } }
-              : prev,
-          );
-        } else if (event === "synthesizing") {
-          setRunState((prev) =>
-            prev.kind === "streaming"
-              ? { kind: "streaming", stage: "synthesizing", specialists: prev.specialists }
-              : prev,
-          );
-        } else if (event === "complete" && data.analysis) {
-          const analysis = data.analysis as CaseAnalysis;
-          setLiveAnalysis(analysis);
-          setDraft(analysis.draftResponse ?? "");
-          setSavedCases((current) =>
-            current.map((item) =>
-              item.id === activeCaseId ? { ...item, status: formatCaseStatus("strategy") } : item,
-            ),
-          );
-        } else if (event === "error" && typeof data.error === "string") {
-          streamError = data.error;
-        }
-      });
-
-      if (streamError) throw new Error(streamError);
-      notify("LangGraph completed a fresh case analysis");
+      setSavedCases((current) =>
+        current.map((item) =>
+          item.id === activeCaseId ? { ...item, status: formatCaseStatus("analyzing") } : item,
+        ),
+      );
+      // The request above only confirms the run started; polling (same
+      // mechanism used to recover a run after a reload) picks up progress
+      // and the final result from here.
+      pollCase(activeCaseId);
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Analysis failed");
-    } finally {
       setRunState({ kind: "idle" });
+      notify(error instanceof Error ? error.message : "Analysis failed");
     }
   };
 
@@ -351,6 +320,32 @@ export default function Home() {
       notify("Response copied to clipboard");
     } catch {
       notify("Draft is ready to copy");
+    }
+  };
+
+  const askAboutCase = async () => {
+    const question = askQuestion.trim();
+    if (!activeCaseId || question.length < 3 || asking) return;
+    setAsking(true);
+    setAskQuestion("");
+    try {
+      const response = await fetch(`/api/cases/${activeCaseId}/ask`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || "The question could not be answered.");
+      }
+      setAskHistory((current) => [...current, { question, answer: result.answer }]);
+    } catch (error) {
+      setAskHistory((current) => [
+        ...current,
+        { question, answer: error instanceof Error ? error.message : "The question could not be answered." },
+      ]);
+    } finally {
+      setAsking(false);
     }
   };
 
@@ -462,6 +457,8 @@ export default function Home() {
       setStoredDocuments(documents);
       setLiveAnalysis(null);
       setDraft("");
+      setAskHistory([]);
+      setAskOpen(false);
       setNewCaseOpen(false);
       setUploadedFiles([]);
       setCaseTitle("");
@@ -567,6 +564,7 @@ export default function Home() {
                 </button>
                 <button className="icon-button" aria-label="Search" onClick={() => notify("Search isn't built yet.")}>⌕</button>
                 <button className="icon-button notification" aria-label="Notifications" onClick={() => notify("You're all caught up")}>♢</button>
+                <button className="ask-trigger" onClick={() => setAskOpen(true)}>💬 Ask about this case</button>
                 <button className="run-button" onClick={runTeam} disabled={analyzing}><span>{analyzing ? "◌" : "✦"}</span>{runButtonLabel(runState)}</button>
               </div>
             </header>
@@ -657,8 +655,94 @@ export default function Home() {
         </div>
       )}
 
+      <AskPanel
+        open={askOpen}
+        onClose={() => setAskOpen(false)}
+        history={askHistory}
+        question={askQuestion}
+        setQuestion={setAskQuestion}
+        onSubmit={askAboutCase}
+        asking={asking}
+      />
+
       <div className={`toast ${toast ? "show" : ""}`} role="status">✓ {toast}</div>
     </main>
+  );
+}
+
+function AskPanel({
+  open,
+  onClose,
+  history,
+  question,
+  setQuestion,
+  onSubmit,
+  asking,
+}: {
+  open: boolean;
+  onClose: () => void;
+  history: AskTurn[];
+  question: string;
+  setQuestion: (v: string) => void;
+  onSubmit: () => void;
+  asking: boolean;
+}) {
+  if (!open) return null;
+
+  return (
+    <>
+      <div className="ask-backdrop" onClick={onClose} />
+      <aside className="ask-panel" role="dialog" aria-modal="true" aria-label="Ask about this case">
+        <div className="ask-panel-header">
+          <div>
+            <h3>Ask about this case</h3>
+            <p>Answers come only from this case&apos;s brief, evidence, and analysis — nothing invented.</p>
+          </div>
+          <button className="ask-panel-close" aria-label="Close" onClick={onClose}>×</button>
+        </div>
+        <div className="ask-panel-body">
+          {history.length === 0 && !asking ? (
+            <p className="ask-empty">
+              Not sure why the case team recommended something, or want to check a detail? Ask in plain language —
+              for example &ldquo;Why is the confidence only 74%?&rdquo; or &ldquo;What does the evidence actually say
+              about the discharge date?&rdquo;
+            </p>
+          ) : (
+            history.map((turn, index) => (
+              <div className="ask-turn" key={index}>
+                <div className="q">{turn.question}</div>
+                <div className="a">{turn.answer}</div>
+              </div>
+            ))
+          )}
+          {asking && (
+            <div className="ask-turn">
+              <div className="a ask-thinking">Thinking…</div>
+            </div>
+          )}
+        </div>
+        <form
+          className="ask-panel-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit();
+          }}
+        >
+          <textarea
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            placeholder="Ask a question about this case…"
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                onSubmit();
+              }
+            }}
+          />
+          <button type="submit" disabled={asking || question.trim().length < 3}>Ask</button>
+        </form>
+      </aside>
+    </>
   );
 }
 
@@ -711,35 +795,31 @@ function EmptyState({
   );
 }
 
-/** The live "what's happening" view: real per-specialist progress while
- * watching (kind: "streaming"), or a recovery notice after a refresh
- * (kind: "recovering"). Never shown for kind: "idle". */
+/** Live "what's happening" view, driven entirely by polling. Works
+ * identically whether you just clicked "Run case team" or reloaded mid-run
+ * and reconnected to one already in progress — there's no distinction
+ * client-side between those two cases anymore. */
 function RunProgress({ runState, compact }: { runState: RunState; compact?: boolean }) {
-  if (runState.kind === "idle") return null;
+  if (runState.kind !== "running") return null;
 
-  if (runState.kind === "recovering") {
-    return (
-      <div className={`run-progress ${compact ? "compact" : ""}`}>
-        <span className="run-progress-spinner" aria-hidden="true">◌</span>
-        <div className="run-progress-body">
-          <strong>Reconnecting to a run already in progress…</strong>
-          <small>You reloaded mid-analysis — the case team kept working on the server. Checking back every few seconds.</small>
-        </div>
-      </div>
-    );
-  }
+  const headline =
+    runState.stage === "synthesizing"
+      ? "Case lead is combining the specialists' work…"
+      : runState.stage === "specialists"
+        ? "Four specialists are reading your evidence…"
+        : "Starting the case team…";
 
   return (
     <div className={`run-progress ${compact ? "compact" : ""}`}>
       <span className="run-progress-spinner" aria-hidden="true">◌</span>
       <div className="run-progress-body">
-        <strong>{runState.stage === "synthesizing" ? "Case lead is combining the specialists' work…" : "Four specialists are reading your evidence…"}</strong>
-        <small>Each one works independently, then the case lead resolves any disagreement into one recommendation.</small>
+        <strong>{headline}</strong>
+        <small>Each specialist works independently, then the case lead resolves any disagreement into one recommendation. This updates every few seconds — if you reload the page mid-run, it picks back up right here automatically.</small>
         <ul className="run-progress-steps">
           {specialistRoles.map((role) => {
             const done = Boolean(runState.specialists[role]);
             return (
-              <li key={role} className={done ? "done" : runState.stage === "specialists" ? "active" : "pending"}>
+              <li key={role} className={done ? "done" : runState.stage !== "synthesizing" ? "active" : "pending"}>
                 <span>{done ? "✓" : "○"}</span>{roleLabel(role)}
               </li>
             );

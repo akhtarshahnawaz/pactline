@@ -130,6 +130,7 @@ export const agentRun = pgTable(
     provider: text("provider").notNull(),
     model: text("model").notNull(),
     status: text("status").default("queued").notNull(),
+    progress: jsonb("progress"),
     result: jsonb("result"),
     error: text("error"),
     startedAt: timestamp("started_at").defaultNow().notNull(),

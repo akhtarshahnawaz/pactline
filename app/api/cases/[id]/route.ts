@@ -19,10 +19,10 @@ export async function GET(request: Request, context: RouteContext) {
     return Response.json({ error: "Case not found" }, { status: 404 });
   }
 
-  // The most recent run of any status, so a client that reloads mid-run can
-  // detect "still running" and reconnect instead of showing a blank slate.
+  // The most recent run of any status, polled by the client while a run is
+  // active (or after a reload mid-run) instead of relying on a stream.
   const [latestRun] = await db
-    .select({ status: agentRun.status })
+    .select({ status: agentRun.status, progress: agentRun.progress })
     .from(agentRun)
     .where(eq(agentRun.caseId, id))
     .orderBy(desc(agentRun.startedAt))
@@ -41,5 +41,6 @@ export async function GET(request: Request, context: RouteContext) {
     case: ownedCase,
     analysis: latestCompleted?.result ?? null,
     runStatus: latestRun?.status ?? null,
+    runProgress: latestRun?.progress ?? null,
   });
 }

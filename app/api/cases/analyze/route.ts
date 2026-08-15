@@ -15,25 +15,30 @@ import {
 import { getAuthorizedSession } from "@/lib/access";
 import { findOwnedCase, listCaseDocuments } from "@/lib/cases/repository";
 
-export const maxDuration = 300;
-
 const StoredCaseRequestSchema = z.object({
   caseId: z.string().uuid(),
 });
 
-const encoder = new TextEncoder();
-
-function sseFrame(event: string, data: unknown) {
-  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
+export type AnalysisProgress = {
+  stage: "specialists" | "synthesizing";
+  specialists: Record<string, { confidence: number }>;
+};
 
 /**
  * The case analysis graph runs four specialists in parallel followed by a
- * synthesis step — five model calls, none of them instant. Rather than make
- * the client wait on one opaque response, this streams progress as each
- * step of `caseAnalysisGraph` completes, using LangGraph's built-in
- * `streamMode: "updates"` (no changes to lib/agents/case-graph.ts needed —
- * it yields each task's output the moment that task resolves).
+ * synthesis step — five model calls, none of them instant. This used to
+ * stream progress over Server-Sent Events, but that response never reached
+ * the browser once deployed (a proxy/edge layer between Railway and the
+ * client buffers it), so progress is instead written to the database as
+ * each step of `caseAnalysisGraph` completes, and the client polls for it —
+ * ordinary request/response, nothing that depends on a stream surviving
+ * infrastructure we don't control.
+ *
+ * This handler validates everything, creates the run row, and returns
+ * immediately; the actual analysis keeps running in this same long-lived
+ * process (this is a persistent Docker service, not a serverless function,
+ * so an un-awaited async task here keeps executing after the response is
+ * sent).
  */
 export async function POST(request: Request) {
   const session = await getAuthorizedSession(request.headers);
@@ -98,126 +103,129 @@ export async function POST(request: Request) {
   }
 
   const runtime = getSafeRuntimeDescriptor();
-  let persistedRunId: string | null = null;
 
-  if (storedCaseId) {
-    persistedRunId = randomUUID();
-    await db.insert(agentRun).values({
-      id: persistedRunId,
-      caseId: storedCaseId,
-      provider: runtime.provider,
-      model: runtime.model,
-      status: "running",
-    });
-    await db
-      .update(caseRecord)
-      .set({ status: "analyzing", updatedAt: new Date() })
-      .where(eq(caseRecord.id, storedCaseId));
+  // The ad-hoc (no persisted case) path has nowhere to poll a result from,
+  // so it still runs the analysis inline and returns the full result.
+  if (!storedCaseId) {
+    try {
+      const analysis = await caseAnalysisGraph.invoke(input);
+      return Response.json({ analysis, runtime, runId: null });
+    } catch (error) {
+      console.error("Ad-hoc case analysis failed", error);
+      if (error instanceof ModelConfigurationError) {
+        return Response.json({ error: error.message }, { status: 503 });
+      }
+      return Response.json(
+        { error: "The analysis could not be completed." },
+        { status: 500 },
+      );
+    }
   }
 
-  const runId = persistedRunId;
   const caseId = storedCaseId;
+  const runId = randomUUID();
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (event: string, data: unknown) =>
-        controller.enqueue(sseFrame(event, data));
-      const startedAt = Date.now();
+  await db.insert(agentRun).values({
+    id: runId,
+    caseId,
+    provider: runtime.provider,
+    model: runtime.model,
+    status: "running",
+  });
+  await db
+    .update(caseRecord)
+    .set({ status: "analyzing", updatedAt: new Date() })
+    .where(eq(caseRecord.id, caseId));
 
-      send("started", { runId, runtime });
-      console.log(
-        `Case analysis started${caseId ? ` for case ${caseId}` : ""} (run ${runId ?? "ad-hoc"})`,
-      );
+  // Deliberately not awaited: this keeps running after the response below
+  // is sent. The client learns about it by polling GET /api/cases/[id].
+  void runAnalysisInBackground({ runId, caseId, input });
 
-      try {
-        let finalAnalysis: CaseAnalysis | null = null;
+  console.log(`Case analysis started for case ${caseId} (run ${runId})`);
 
-        const graphStream = await caseAnalysisGraph.stream(input, {
-          streamMode: "updates",
-        });
+  return Response.json({ runId, runtime }, { status: 202 });
+}
 
-        for await (const chunk of graphStream) {
-          if (!chunk || typeof chunk !== "object") continue;
-          const update = chunk as Record<string, unknown>;
+async function runAnalysisInBackground({
+  runId,
+  caseId,
+  input,
+}: {
+  runId: string;
+  caseId: string;
+  input: CaseInput;
+}) {
+  const startedAt = Date.now();
 
-          if ("supply_chain_specialist" in update) {
-            const specialist = update.supply_chain_specialist as {
-              role: string;
-              confidence: number;
-              findings: unknown[];
-              risks: unknown[];
-            };
-            send("specialist", {
-              role: specialist.role,
-              confidence: specialist.confidence,
-              findings: specialist.findings?.length ?? 0,
-              risks: specialist.risks?.length ?? 0,
-            });
-          }
+  try {
+    let finalAnalysis: CaseAnalysis | null = null;
+    const progress: AnalysisProgress = { stage: "specialists", specialists: {} };
 
-          if ("case_lead_synthesis" in update) {
-            finalAnalysis = update.case_lead_synthesis as CaseAnalysis;
-            send("synthesizing", {});
-          }
-        }
+    const graphStream = await caseAnalysisGraph.stream(input, {
+      streamMode: "updates",
+    });
 
-        if (!finalAnalysis) {
-          throw new Error("The case team did not return a result.");
-        }
+    for await (const chunk of graphStream) {
+      if (!chunk || typeof chunk !== "object") continue;
+      const update = chunk as Record<string, unknown>;
 
-        console.log(
-          `Case analysis finished${caseId ? ` for case ${caseId}` : ""} in ${Date.now() - startedAt}ms`,
-        );
-
-        if (runId && caseId) {
-          await db
-            .update(agentRun)
-            .set({
-              status: "completed",
-              result: finalAnalysis,
-              completedAt: new Date(),
-            })
-            .where(eq(agentRun.id, runId));
-          await db
-            .update(caseRecord)
-            .set({ status: "strategy", updatedAt: new Date() })
-            .where(eq(caseRecord.id, caseId));
-        }
-
-        send("complete", { analysis: finalAnalysis, runtime, runId });
-      } catch (error) {
-        console.error("Case analysis failed", error);
-        const message =
-          error instanceof Error
-            ? error.message.slice(0, 2_000)
-            : "Analysis failed.";
-
-        if (runId) {
-          await db
-            .update(agentRun)
-            .set({ status: "failed", error: message, completedAt: new Date() })
-            .where(eq(agentRun.id, runId));
-        }
-        if (caseId) {
-          await db
-            .update(caseRecord)
-            .set({ status: "evidence", updatedAt: new Date() })
-            .where(eq(caseRecord.id, caseId));
-        }
-
-        send("error", { error: "The analysis could not be completed." });
-      } finally {
-        controller.close();
+      if ("supply_chain_specialist" in update) {
+        const specialist = update.supply_chain_specialist as {
+          role: string;
+          confidence: number;
+        };
+        progress.specialists[specialist.role] = { confidence: specialist.confidence };
+        await db
+          .update(agentRun)
+          .set({ progress })
+          .where(eq(agentRun.id, runId));
       }
-    },
-  });
 
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    },
-  });
+      if ("case_lead_synthesis" in update) {
+        finalAnalysis = update.case_lead_synthesis as CaseAnalysis;
+        progress.stage = "synthesizing";
+        await db
+          .update(agentRun)
+          .set({ progress })
+          .where(eq(agentRun.id, runId));
+      }
+    }
+
+    if (!finalAnalysis) {
+      throw new Error("The case team did not return a result.");
+    }
+
+    console.log(
+      `Case analysis finished for case ${caseId} in ${Date.now() - startedAt}ms`,
+    );
+
+    await db
+      .update(agentRun)
+      .set({
+        status: "completed",
+        result: finalAnalysis,
+        progress: null,
+        completedAt: new Date(),
+      })
+      .where(eq(agentRun.id, runId));
+    await db
+      .update(caseRecord)
+      .set({ status: "strategy", updatedAt: new Date() })
+      .where(eq(caseRecord.id, caseId));
+  } catch (error) {
+    console.error("Case analysis failed", error);
+    const message =
+      error instanceof Error
+        ? error.message.slice(0, 2_000)
+        : "Analysis failed.";
+
+    await db
+      .update(agentRun)
+      .set({ status: "failed", error: message, progress: null, completedAt: new Date() })
+      .where(eq(agentRun.id, runId));
+    await db
+      .update(caseRecord)
+      .set({ status: "evidence", updatedAt: new Date() })
+      .where(eq(caseRecord.id, caseId));
+  }
 }

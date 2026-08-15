@@ -15,6 +15,13 @@
       "when": 1786718558268,
       "tag": "0001_rapid_payback",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786766183416,
+      "tag": "0002_wealthy_fixer",
+      "breakpoints": true
     }
   ]
 }
