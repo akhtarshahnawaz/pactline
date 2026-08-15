@@ -88,7 +88,14 @@ export async function POST(request: Request) {
         .where(eq(caseRecord.id, storedCaseId));
     }
 
+    const startedAt = Date.now();
+    console.log(
+      `Case analysis started${storedCaseId ? ` for case ${storedCaseId}` : ""} (run ${persistedRunId ?? "ad-hoc"})`,
+    );
     const analysis = await caseAnalysisGraph.invoke(input);
+    console.log(
+      `Case analysis finished${storedCaseId ? ` for case ${storedCaseId}` : ""} in ${Date.now() - startedAt}ms`,
+    );
 
     if (persistedRunId && storedCaseId) {
       await db

@@ -105,6 +105,7 @@ export function createChatModel(): BaseChatModel {
       apiKey: config.apiKey,
       temperature: 0,
       maxRetries: 2,
+      clientOptions: { timeout: 120_000 },
     });
   }
 
@@ -116,6 +117,7 @@ export function createChatModel(): BaseChatModel {
     // rather than forced to 0. Anthropic models still get temperature: 0
     // above, since Claude supports it.
     maxRetries: 2,
+    timeout: 120_000,
     configuration:
       config.provider === "openai-compatible"
         ? { baseURL: config.baseURL }
