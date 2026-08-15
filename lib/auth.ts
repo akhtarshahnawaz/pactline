@@ -7,8 +7,6 @@ import { db } from "@/db";
 import * as schema from "@/db/schema";
 
 const authEnabled = process.env.AUTH_ENABLED === "true";
-const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim();
-const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
 const authBaseUrl =
   process.env.BETTER_AUTH_URL?.trim() || "http://localhost:3000";
 const authSecret =
@@ -18,11 +16,6 @@ const authSecret =
 if (authEnabled && process.env.NODE_ENV === "production") {
   if (!process.env.BETTER_AUTH_SECRET) {
     throw new Error("BETTER_AUTH_SECRET is required when AUTH_ENABLED=true.");
-  }
-  if (!googleClientId || !googleClientSecret) {
-    throw new Error(
-      "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required when AUTH_ENABLED=true.",
-    );
   }
 }
 
@@ -34,14 +27,14 @@ export const auth = betterAuth({
     provider: "pg",
     schema,
   }),
-  socialProviders:
-    googleClientId && googleClientSecret
-      ? {
-          google: {
-            clientId: googleClientId,
-            clientSecret: googleClientSecret,
-          },
-        }
-      : {},
+  emailAndPassword: {
+    enabled: true,
+    minPasswordLength: 8,
+    maxPasswordLength: 128,
+    // No email provider is configured for this prototype, so verification
+    // stays off and sign-up signs the user straight in.
+    requireEmailVerification: false,
+    autoSignIn: true,
+  },
   trustedOrigins: [authBaseUrl],
 });

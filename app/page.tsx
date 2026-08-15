@@ -16,11 +16,24 @@ type RuntimeStatus = {
   access?: string;
 };
 
-type LiveAnalysis = {
+type SpecialistOutput = {
+  role: string;
+  findings: { claim: string; status: string; sourceIds: string[]; confidence: number }[];
+  risks: string[];
+  openQuestions: string[];
+  recommendations: string[];
+  confidence: number;
+};
+
+type CaseAnalysis = {
   executiveSummary: string;
   recommendedPosition: string;
   confidence: number;
+  alternatives: { name: string; whenToUse: string; tradeoffs: string }[];
+  priorityActions: { action: string; owner: string; timing: string; reason: string }[];
+  evidenceGaps: string[];
   draftResponse: string;
+  specialistOutputs: SpecialistOutput[];
 };
 
 type StoredDocument = {
@@ -42,103 +55,39 @@ type CreatedCaseView = {
   status: string;
 };
 
-const activeCase = {
-  title: "Jazan voyage termination",
-  subtitle: "Cargo insurance recovery · Claim 59252/C/26 + 59253/C/26",
-  status: "Position challenged",
-};
-
-const pastCase = {
-  title: "Red Sea surcharge dispute",
-  subtitle: "14 × 20′ containers · Dammam",
-  status: "Won · $50,100 recovered",
-};
-
-const evidence = [
-  {
-    type: "EMAIL THREAD",
-    title: "Insurer correspondence",
-    meta: "10 pages · 11 Aug 2026",
-    note: "Preliminary denial, reservation of rights, and escalation request",
-    facts: 9,
-    color: "coral",
-  },
-  {
-    type: "POLICY",
-    title: "CIC marine cargo policies",
-    meta: "2 policies · All Risks",
-    note: "Section IV(2) Duty of the Insured identified as primary lever",
-    facts: 7,
-    color: "green",
-  },
-  {
-    type: "BILL OF LADING",
-    title: "SLGS262469 + SLGS262184",
-    meta: "Shanghai → Jeddah",
-    note: "Contracted destination conflicts with forced discharge at Jazan",
-    facts: 12,
-    color: "blue",
-  },
-  {
-    type: "CARGO RECORD",
-    title: "Chop roving 2400",
-    meta: "166.4 MT · 8 × 20′ GP",
-    note: "Heat exposure supports imminent physical-loss argument",
-    facts: 5,
-    color: "amber",
-  },
-];
-
-const strategyRoutes = [
-  {
-    label: "PRIMARY POSITION",
-    title: "Sue & labor / preservation expense",
-    score: 82,
-    description:
-      "Frame emergency extraction and onward transit as reasonable measures taken to avert imminent physical loss—not as delay costs.",
-    tags: ["Section IV(2)", "Physical peril", "Mitigation duty"],
-    tone: "recommended",
-  },
-  {
-    label: "FALLBACK",
-    title: "Carrier recovery & commercial settlement",
-    score: 61,
-    description:
-      "Preserve recourse against the carrier while using the documented destination failure to negotiate a cost-sharing resolution.",
-    tags: ["B/L obligation", "Subrogation", "Cost share"],
-    tone: "fallback",
-  },
-  {
-    label: "AVOID AS LEAD",
-    title: "Forwarding charges after sea peril",
-    score: 34,
-    description:
-      "The adjuster has already narrowed this clause and argues that Red Sea security hazards are not a qualifying sea peril.",
-    tags: ["Already rebutted", "High friction"],
-    tone: "avoid",
-  },
-];
-
-const defaultDraft = `Dear Wyne,
-
-Thank you for setting out underwriters’ preliminary position. APS respectfully requests senior review of both claim files.
-
-Our claim is not for commercial delay or loss of market. The expenses were incurred to discharge APS’s express duty under Section IV, Clause 2 to protect and preserve the insured cargo from an imminent physical loss.
-
-The cargo—166.4 MT of fiberglass chop roving across eight 20′ containers—was involuntarily discharged at an unnominated port and left on exposed terminal tarmac. Under these conditions, container temperatures may exceed 60–65°C, creating a documented risk of binder softening, filament fusion, and irreversible physical damage.
-
-APS therefore requests that CIC confirm in principle that reasonable emergency extraction, handling, and onward-transit costs incurred to avert that loss are recoverable. Please also keep both files active while the supporting thermal evidence and cost schedule are finalized.
-
-All rights are reserved.`;
-
 function Glyph({ children }: { children: React.ReactNode }) {
   return <span className="glyph" aria-hidden="true">{children}</span>;
+}
+
+function initials(title: string) {
+  const letters = title
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((word) => word[0]?.toUpperCase() ?? "")
+    .join("");
+  return letters || "?";
+}
+
+function roleLabel(role: string) {
+  const labels: Record<string, string> = {
+    contract: "Contract analyst",
+    operations: "Operations analyst",
+    risk: "Risk modeler",
+    negotiation: "Negotiation strategist",
+  };
+  return labels[role] ?? role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function roleAvatarClass(role: string) {
+  if (role === "negotiation") return "writer";
+  if (["contract", "risk"].includes(role)) return role;
+  return "contract";
 }
 
 export default function Home() {
   const router = useRouter();
   const [view, setView] = useState<View>("Overview");
-  const [caseMode, setCaseMode] = useState<"active" | "won">("active");
   const [newCaseOpen, setNewCaseOpen] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [caseTitle, setCaseTitle] = useState("");
@@ -147,25 +96,57 @@ export default function Home() {
   const [savedCases, setSavedCases] = useState<CreatedCaseView[]>([]);
   const [activeCaseId, setActiveCaseId] = useState<string | null>(null);
   const [storedDocuments, setStoredDocuments] = useState<StoredDocument[]>([]);
-  const [draft, setDraft] = useState(defaultDraft);
+  const [draft, setDraft] = useState("");
   const [toast, setToast] = useState("");
   const [running, setRunning] = useState(false);
-  const [done, setDone] = useState([false, false, false]);
+  const [loadingInitial, setLoadingInitial] = useState(true);
   const [runtime, setRuntime] = useState<RuntimeStatus>({
     orchestrator: "LangGraph",
     provider: "provider neutral",
     model: "",
     configured: false,
   });
-  const [liveAnalysis, setLiveAnalysis] = useState<LiveAnalysis | null>(null);
+  const [liveAnalysis, setLiveAnalysis] = useState<CaseAnalysis | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const notify = (message: string) => {
+    setToast(message);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 2400);
+  };
+
+  const loadCase = async (caseId: string) => {
+    setLiveAnalysis(null);
+    setStoredDocuments([]);
+    setDraft("");
+    try {
+      const [documentsResponse, caseResponse] = await Promise.all([
+        fetch(`/api/cases/${caseId}/documents`),
+        fetch(`/api/cases/${caseId}`),
+      ]);
+      if (documentsResponse.ok) {
+        const documentsResult = await documentsResponse.json();
+        setStoredDocuments(documentsResult.documents ?? []);
+      }
+      if (caseResponse.ok) {
+        const caseResult = await caseResponse.json();
+        if (caseResult.analysis) {
+          setLiveAnalysis(caseResult.analysis);
+          setDraft(caseResult.analysis.draftResponse ?? "");
+        }
+      }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "The case could not be loaded");
+    }
+  };
+
   useEffect(() => {
-    fetch("/api/runtime")
-      .then((response) => response.json())
-      .then(async (value: RuntimeStatus) => {
+    (async () => {
+      try {
+        const response = await fetch("/api/runtime");
+        const value: RuntimeStatus = await response.json();
         setRuntime(value);
-        if (value.authentication !== "Google") return;
+        if (value.authentication !== "email") return;
 
         const casesResponse = await fetch("/api/cases");
         if (!casesResponse.ok) return;
@@ -181,52 +162,32 @@ export default function Home() {
         setSavedCases(restored);
 
         const latest = restored[0];
-        if (!latest) return;
-        setActiveCaseId(latest.id);
-        setCaseMode("active");
-        const documentsResponse = await fetch(
-          `/api/cases/${latest.id}/documents`,
-        );
-        if (documentsResponse.ok) {
-          const documentsResult = await documentsResponse.json();
-          setStoredDocuments(documentsResult.documents ?? []);
+        if (latest) {
+          setActiveCaseId(latest.id);
+          await loadCase(latest.id);
         }
-      })
-      .catch(() => undefined);
+      } catch {
+        // Runtime status is best-effort; keep defaults on failure.
+      } finally {
+        setLoadingInitial(false);
+      }
+    })();
 
     return () => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const notify = (message: string) => {
-    setToast(message);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 2400);
-  };
-
   const runTeam = async () => {
+    if (!activeCaseId) return;
     setRunning(true);
 
     try {
       const response = await fetch("/api/cases/analyze", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(
-          activeCaseId
-            ? { caseId: activeCaseId }
-            : {
-                brief:
-                  "Eight containers of fiberglass chop roving contracted for Jeddah were forcibly discharged at Jazan. The insurer preliminarily denied emergency extraction and onward-transit costs. We need a defensible recovery and negotiation strategy without overstating the unverified thermal exposure claim.",
-                objective:
-                  "Preserve both insurance claims, maximize legitimate recovery, and prepare the next evidence-led response.",
-                evidence: evidence.map((item, index) => ({
-                  id: `evidence-${index + 1}`,
-                  name: item.title,
-                  text: `${item.meta}. ${item.note}`,
-                })),
-              },
-        ),
+        body: JSON.stringify({ caseId: activeCaseId }),
       });
       const result = await response.json();
 
@@ -235,7 +196,14 @@ export default function Home() {
       }
 
       setLiveAnalysis(result.analysis);
-      setDraft(result.analysis.draftResponse);
+      setDraft(result.analysis.draftResponse ?? "");
+      setSavedCases((current) =>
+        current.map((item) =>
+          item.id === activeCaseId
+            ? { ...item, status: formatCaseStatus("strategy") }
+            : item,
+        ),
+      );
       notify("LangGraph completed a fresh case analysis");
     } catch (error) {
       notify(error instanceof Error ? error.message : "Analysis failed");
@@ -254,8 +222,8 @@ export default function Home() {
   };
 
   const openWorkspaceMenu = async () => {
-    if (runtime.authentication !== "Google") {
-      notify("Google sign-in is disabled for local development");
+    if (runtime.authentication !== "email") {
+      notify("Sign-in is disabled for local development");
       return;
     }
 
@@ -264,22 +232,9 @@ export default function Home() {
   };
 
   const openSavedCase = async (savedCase: CreatedCaseView) => {
-    setCaseMode("active");
     setActiveCaseId(savedCase.id);
-    setLiveAnalysis(null);
-    setStoredDocuments([]);
-    setView("Evidence");
-
-    try {
-      const response = await fetch(`/api/cases/${savedCase.id}/documents`);
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.error || "Evidence could not be loaded.");
-      }
-      setStoredDocuments(result.documents ?? []);
-    } catch (error) {
-      notify(error instanceof Error ? error.message : "Evidence could not be loaded");
-    }
+    setView("Overview");
+    await loadCase(savedCase.id);
   };
 
   const appendEvidence = async (files: File[]) => {
@@ -358,10 +313,12 @@ export default function Home() {
       const ready = documents.filter(
         (document) => document.extractionStatus === "ready",
       ).length;
-      const savedCase = {
+      const savedCase: CreatedCaseView = {
         id: caseResult.case.id,
         title: caseResult.case.title,
-        subtitle: `${documents.length} stored file${documents.length === 1 ? "" : "s"} · ${ready} text-ready`,
+        subtitle: documents.length
+          ? `${documents.length} stored file${documents.length === 1 ? "" : "s"} · ${ready} text-ready`
+          : "No evidence uploaded yet",
         status: failures.length ? "Evidence needs review" : "Evidence preserved",
       };
       setSavedCases((currentCases) => [
@@ -371,16 +328,18 @@ export default function Home() {
       setActiveCaseId(caseResult.case.id);
       setStoredDocuments(documents);
       setLiveAnalysis(null);
+      setDraft("");
       setNewCaseOpen(false);
       setUploadedFiles([]);
       setCaseTitle("");
       setCaseBrief("");
-      setCaseMode("active");
-      setView("Evidence");
+      setView("Overview");
       notify(
         failures.length
           ? `${documents.length} files stored · ${failures.length} need attention`
-          : `${documents.length} original files stored safely`,
+          : documents.length
+            ? `${documents.length} original files stored safely`
+            : "Case created",
       );
     } catch (error) {
       notify(error instanceof Error ? error.message : "Case creation failed");
@@ -389,12 +348,11 @@ export default function Home() {
     }
   };
 
-  const current =
-    caseMode === "won"
-      ? pastCase
-      : activeCaseId
-        ? savedCases.find((item) => item.id === activeCaseId) ?? activeCase
-        : activeCase;
+  const current = activeCaseId
+    ? savedCases.find((item) => item.id === activeCaseId)
+    : undefined;
+  const hasWorkspace = Boolean(activeCaseId && current);
+  const isClosed = current?.status.toLowerCase().includes("closed") ?? false;
 
   return (
     <main className="app-shell">
@@ -411,7 +369,7 @@ export default function Home() {
 
         <nav className="main-nav" aria-label="Main navigation">
           <p>WORKSPACE</p>
-          <button onClick={() => notify("Inbox is clear")}><Glyph>⌁</Glyph> Inbox <em>2</em></button>
+          <button onClick={() => notify("Inbox is clear")}><Glyph>⌁</Glyph> Inbox</button>
           <button className="selected"><Glyph>▣</Glyph> Cases</button>
           <button onClick={() => notify("Playbooks will learn from every outcome")}><Glyph>⌘</Glyph> Playbooks</button>
           <button onClick={() => notify("Knowledge base is connected to this case")}><Glyph>◇</Glyph> Knowledge</button>
@@ -419,71 +377,119 @@ export default function Home() {
         </nav>
 
         <div className="case-list">
-          <div className="case-list-title"><span>RECENT CASES</span><button aria-label="More case options">•••</button></div>
-          {savedCases.slice(0, 4).map((savedCase, index) => <button key={savedCase.id} className={caseMode === "active" && activeCaseId === savedCase.id ? "case active" : "case"} onClick={() => openSavedCase(savedCase)}>
-            <span className="case-icon alert">{index === 0 ? "NEW" : "SC"}</span>
-            <span><strong>{savedCase.title}</strong><small>{savedCase.status}</small></span>
-          </button>)}
-          <button className={caseMode === "active" && !activeCaseId ? "case active" : "case"} onClick={() => { setCaseMode("active"); setActiveCaseId(null); setStoredDocuments([]); setLiveAnalysis(null); setView("Overview"); }}>
-            <span className="case-icon alert">JZ</span>
-            <span><strong>Jazan voyage termination</strong><small>Position challenged · 2h</small></span>
-          </button>
-          <button className={caseMode === "won" ? "case active" : "case"} onClick={() => { setCaseMode("won"); setLiveAnalysis(null); setView("Overview"); }}>
-            <span className="case-icon win">RS</span>
-            <span><strong>Red Sea surcharge</strong><small>$50,100 recovered · Won</small></span>
-          </button>
+          <div className="case-list-title">
+            <span>RECENT CASES</span>
+            {savedCases.length > 0 && <button aria-label="More case options">•••</button>}
+          </div>
+          {savedCases.length === 0 ? (
+            <p style={{ padding: "6px 9px", fontSize: 11, lineHeight: 1.5, color: "#7fa094" }}>
+              {loadingInitial ? "Loading…" : "No cases yet. Create your first one."}
+            </p>
+          ) : (
+            savedCases.slice(0, 8).map((savedCase) => (
+              <button
+                key={savedCase.id}
+                className={activeCaseId === savedCase.id ? "case active" : "case"}
+                onClick={() => openSavedCase(savedCase)}
+              >
+                <span className={`case-icon ${savedCase.status.toLowerCase().includes("closed") ? "win" : "alert"}`}>
+                  {initials(savedCase.title)}
+                </span>
+                <span><strong>{savedCase.title}</strong><small>{savedCase.status}</small></span>
+              </button>
+            ))
+          )}
         </div>
 
         <div className="sidebar-foot">
-          <div className="workspace-avatar">AP</div>
-          <div><strong>APS Workspace</strong><span>Decision support</span></div>
-          <button aria-label={runtime.authentication === "Google" ? "Sign out" : "Workspace settings"} onClick={openWorkspaceMenu}>{runtime.authentication === "Google" ? "↪" : "⌄"}</button>
+          <div className="workspace-avatar">{initials(runtime.model || "PL")}</div>
+          <div><strong>Your workspace</strong><span>Decision support</span></div>
+          <button aria-label={runtime.authentication === "email" ? "Sign out" : "Workspace settings"} onClick={openWorkspaceMenu}>{runtime.authentication === "email" ? "↪" : "⌄"}</button>
         </div>
       </aside>
 
       <section className="workspace">
-        <header className="topbar">
-          <div className="case-heading">
-            <div className={`status-orb ${caseMode === "won" ? "won" : ""}`}>{caseMode === "won" ? "✓" : "!"}</div>
-            <div>
-              <div className="eyebrow"><span>{caseMode === "won" ? "CLOSED CASE" : "ACTIVE CASE"}</span><b>•</b>{current.status}</div>
-              <h1>{current.title}</h1>
-              <p>{current.subtitle}</p>
-            </div>
-          </div>
-          <div className="top-actions">
-            <button
-              className={`runtime-badge ${runtime.configured ? "ready" : ""}`}
-              onClick={() =>
-                notify(
-                  `${runtime.orchestrator} · ${runtime.provider} · ${runtime.model}`,
-                )
-              }
-            >
-              <i />
-              {runtime.orchestrator} · {runtime.provider}
-            </button>
-            <button className="icon-button" aria-label="Search" onClick={() => notify("Search opened")}>⌕</button>
-            <button className="icon-button notification" aria-label="Notifications" onClick={() => notify("2 case updates")}>♢<i /></button>
-            {caseMode === "active" && <button className="run-button" onClick={runTeam} disabled={running}><span>{running ? "◌" : "✦"}</span>{running ? "Analyzing…" : "Run case team"}</button>}
-          </div>
-        </header>
-
-        <nav className="case-tabs" aria-label="Case sections">
-          {(["Overview", "Evidence", "Strategy", "Drafts"] as View[]).map((item) => (
-            <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>{item}{item === "Evidence" && <span>{activeCaseId ? storedDocuments.length : 4}</span>}{item === "Drafts" && <span>2</span>}</button>
-          ))}
-        </nav>
-
-        {caseMode === "won" ? (
-          <WonCase onOpen={() => { setCaseMode("active"); setView("Overview"); }} />
-        ) : (
+        {hasWorkspace && current ? (
           <>
-            {view === "Overview" && <Overview done={done} setDone={setDone} goTo={setView} notify={notify} analysis={liveAnalysis} runtime={runtime} />}
-            {view === "Evidence" && <Evidence notify={notify} documents={activeCaseId ? storedDocuments : []} isStoredCase={Boolean(activeCaseId)} onAddEvidence={appendEvidence} uploading={creatingCase} />}
-            {view === "Strategy" && <Strategy goTo={setView} />}
-            {view === "Drafts" && <Drafts draft={draft} setDraft={setDraft} onCopy={copyDraft} notify={notify} />}
+            <header className="topbar">
+              <div className="case-heading">
+                <div className={`status-orb ${isClosed ? "won" : ""}`}>{isClosed ? "✓" : "!"}</div>
+                <div>
+                  <div className="eyebrow"><span>{isClosed ? "CLOSED CASE" : "ACTIVE CASE"}</span><b>•</b>{current.status}</div>
+                  <h1>{current.title}</h1>
+                  <p>{current.subtitle}</p>
+                </div>
+              </div>
+              <div className="top-actions">
+                <button
+                  className={`runtime-badge ${runtime.configured ? "ready" : ""}`}
+                  onClick={() =>
+                    notify(
+                      `${runtime.orchestrator} · ${runtime.provider} · ${runtime.model}`,
+                    )
+                  }
+                >
+                  <i />
+                  {runtime.orchestrator} · {runtime.provider}
+                </button>
+                <button className="icon-button" aria-label="Search" onClick={() => notify("Search opened")}>⌕</button>
+                <button className="icon-button notification" aria-label="Notifications" onClick={() => notify("You're all caught up")}>♢</button>
+                <button className="run-button" onClick={runTeam} disabled={running}><span>{running ? "◌" : "✦"}</span>{running ? "Analyzing…" : "Run case team"}</button>
+              </div>
+            </header>
+
+            <nav className="case-tabs" aria-label="Case sections">
+              {(["Overview", "Evidence", "Strategy", "Drafts"] as View[]).map((item) => (
+                <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>
+                  {item}
+                  {item === "Evidence" && storedDocuments.length > 0 && <span>{storedDocuments.length}</span>}
+                  {item === "Drafts" && liveAnalysis && <span>1</span>}
+                </button>
+              ))}
+            </nav>
+
+            {view === "Overview" && (
+              <Overview
+                key={activeCaseId}
+                analysis={liveAnalysis}
+                documents={storedDocuments}
+                running={running}
+                onRun={runTeam}
+                goTo={setView}
+              />
+            )}
+            {view === "Evidence" && (
+              <Evidence
+                key={activeCaseId}
+                documents={storedDocuments}
+                onAddEvidence={appendEvidence}
+                uploading={creatingCase}
+              />
+            )}
+            {view === "Strategy" && (
+              <Strategy
+                key={activeCaseId}
+                analysis={liveAnalysis}
+                running={running}
+                onRun={runTeam}
+                goTo={setView}
+              />
+            )}
+            {view === "Drafts" && (
+              <Drafts
+                key={activeCaseId}
+                analysis={liveAnalysis}
+                draft={draft}
+                setDraft={setDraft}
+                onCopy={copyDraft}
+                notify={notify}
+                running={running}
+                onRun={runTeam}
+              />
+            )}
           </>
+        ) : (
+          <EmptyWorkspace onCreate={() => setNewCaseOpen(true)} loading={loadingInitial} />
         )}
       </section>
 
@@ -523,100 +529,187 @@ export default function Home() {
   );
 }
 
-function Overview({ done, setDone, goTo, notify, analysis, runtime }: { done: boolean[]; setDone: (v: boolean[]) => void; goTo: (v: View) => void; notify: (m: string) => void; analysis: LiveAnalysis | null; runtime: RuntimeStatus }) {
-  const actions = [
-    ["Today", "Commission independent thermal evidence", "Support 60–65°C exposure and binder degradation risk"],
-    ["Today", "Send reservation-of-rights follow-up", "Keep both files active while evidence is assembled"],
-    ["Next", "Build a segregated cost schedule", "Separate preservation costs from delay, storage and demurrage"],
+function EmptyWorkspace({ onCreate, loading }: { onCreate: () => void; loading: boolean }) {
+  return (
+    <div className="workspace-empty">
+      <span className="empty-icon" aria-hidden="true">＋</span>
+      <h2>{loading ? "Loading your workspace…" : "Your workspace is empty."}</h2>
+      <p>
+        {loading
+          ? "Checking for saved cases."
+          : "Create a case and add the contracts, correspondence, or shipment records involved. The case team builds its strategy only from what you give it."}
+      </p>
+      {!loading && <button onClick={onCreate}>＋ New case</button>}
+    </div>
+  );
+}
+
+function EmptyState({
+  icon,
+  title,
+  body,
+  actionLabel,
+  onAction,
+  actionDisabled,
+}: {
+  icon: string;
+  title: string;
+  body: string;
+  actionLabel?: string;
+  onAction?: () => void;
+  actionDisabled?: boolean;
+}) {
+  return (
+    <section className="stored-empty">
+      <span>{icon}</span>
+      <h3>{title}</h3>
+      <p>{body}</p>
+      {actionLabel && onAction && (
+        <button
+          className={`evidence-upload ${actionDisabled ? "disabled" : ""}`}
+          style={{ marginTop: 16 }}
+          onClick={onAction}
+          disabled={actionDisabled}
+        >
+          {actionLabel}
+        </button>
+      )}
+    </section>
+  );
+}
+
+function Overview({
+  analysis,
+  documents,
+  running,
+  onRun,
+  goTo,
+}: {
+  analysis: CaseAnalysis | null;
+  documents: StoredDocument[];
+  running: boolean;
+  onRun: () => void;
+  goTo: (v: View) => void;
+}) {
+  const [done, setDone] = useState<Set<number>>(new Set());
+
+  if (!analysis) {
+    return (
+      <div className="content-view single-column">
+        <EmptyState
+          icon="✦"
+          title="No strategy yet."
+          body="Run the case team once your evidence is in place. The case lead synthesizes a recommended position, priority actions, and a draft response from what the specialists find in your documents."
+          actionLabel={running ? "Analyzing…" : "Run case team"}
+          onAction={onRun}
+          actionDisabled={running || documents.length === 0}
+        />
+      </div>
+    );
+  }
+
+  const toggle = (index: number) =>
+    setDone((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+
+  const readyDocs = documents.filter((document) => document.extractionStatus === "ready").length;
+  const risks = analysis.specialistOutputs.flatMap((specialist) => specialist.risks);
+  const team = [
+    { role: "lead", label: "Case lead", note: "Synthesized the team's position", confidence: analysis.confidence },
+    ...analysis.specialistOutputs.map((specialist) => ({
+      role: specialist.role,
+      label: roleLabel(specialist.role),
+      note: `${specialist.findings.length} finding${specialist.findings.length === 1 ? "" : "s"} · ${specialist.risks.length} risk${specialist.risks.length === 1 ? "" : "s"}`,
+      confidence: specialist.confidence,
+    })),
   ];
+
   return (
     <div className="overview-grid content-view">
       <div className="overview-main">
-        <section className="hero-card">
+        <section className="hero-card no-visual">
           <div className="hero-copy">
             <div className="section-kicker"><span>✦</span> CASE TEAM RECOMMENDATION</div>
-            <h2>{analysis ? analysis.recommendedPosition : <>Reframe the claim around <em>preventing physical loss.</em></>}</h2>
-            <p>{analysis?.executiveSummary ?? "Do not lead with extra forwarding costs. Establish that forced discharge exposed stable cargo to a new, external heat peril—and that removal was a policy-mandated preservation measure."}</p>
-            <div className="confidence"><span>CONFIDENCE</span><div><i style={{ width: `${Math.round((analysis?.confidence ?? .82) * 100)}%` }} /></div><strong>{Math.round((analysis?.confidence ?? .82) * 100)}%</strong><small>{(analysis?.confidence ?? .82) >= .75 ? "High" : "Review"}</small></div>
+            <h2>{analysis.recommendedPosition}</h2>
+            <p>{analysis.executiveSummary}</p>
+            <div className="confidence"><span>CONFIDENCE</span><div><i style={{ width: `${Math.round(analysis.confidence * 100)}%` }} /></div><strong>{Math.round(analysis.confidence * 100)}%</strong><small>{analysis.confidence >= .75 ? "High" : "Review"}</small></div>
             <div className="hero-buttons">
               <button className="primary" onClick={() => goTo("Strategy")}>View full strategy <span>→</span></button>
               <button onClick={() => goTo("Drafts")}><span>✎</span> Draft response</button>
             </div>
           </div>
-          <div className="route-visual" aria-label="Shipment route from Shanghai to Jeddah, interrupted at Jazan">
-            <div className="route-label origin"><span />Shanghai<small>ORIGIN</small></div>
-            <div className="route-line"><i /><b /><em /></div>
-            <div className="route-label disruption"><span>!</span>Jazan<small>FORCED DISCHARGE</small></div>
-            <div className="route-line muted"><i /></div>
-            <div className="route-label destination"><span />Jeddah<small>CONTRACTED PORT</small></div>
-            <div className="cargo-chip"><span>▦</span><div><strong>8 × 20′ GP</strong><small>166.4 MT chop roving</small></div></div>
-          </div>
         </section>
 
         <section className="metric-row">
-          <div><span>VALUE AT RISK</span><strong>$141.0k</strong><small>Across 2 policies</small></div>
-          <div><span>CARGO EXPOSURE</span><strong>60–65°C</strong><small>Estimated container temp.</small></div>
-          <div><span>TIME SINCE DENIAL</span><strong>3 days</strong><small>Response window open</small></div>
-          <div><span>KEY LEVER</span><strong>§ IV(2)</strong><small>Duty of the Insured</small></div>
+          <div><span>EVIDENCE USED</span><strong>{readyDocs}</strong><small>Text-ready documents</small></div>
+          <div><span>PRIORITY ACTIONS</span><strong>{analysis.priorityActions.length}</strong><small>Recommended next steps</small></div>
+          <div><span>ALTERNATIVES</span><strong>{analysis.alternatives.length}</strong><small>Other routes considered</small></div>
+          <div><span>EVIDENCE GAPS</span><strong>{analysis.evidenceGaps.length}</strong><small>Open before you commit</small></div>
         </section>
 
-        <section className="action-section">
-          <div className="section-heading"><div><span>PRIORITY ACTIONS</span><h3>What moves the position now</h3></div><button onClick={() => notify("Action owner menu opened")}>Assign owner <span>＋</span></button></div>
-          <div className="action-list">
-            {actions.map((action, index) => (
-              <button className={done[index] ? "action done" : "action"} key={action[1]} onClick={() => { const next = [...done]; next[index] = !next[index]; setDone(next); }}>
-                <span className="check">{done[index] ? "✓" : index + 1}</span>
-                <span className={`due ${index === 2 ? "next" : ""}`}>{action[0]}</span>
-                <span className="action-copy"><strong>{action[1]}</strong><small>{action[2]}</small></span>
-                <span className="arrow">→</span>
-              </button>
-            ))}
-          </div>
-        </section>
+        {analysis.priorityActions.length > 0 && (
+          <section className="action-section">
+            <div className="section-heading"><div><span>PRIORITY ACTIONS</span><h3>What moves the position now</h3></div></div>
+            <div className="action-list">
+              {analysis.priorityActions.map((action, index) => (
+                <button className={done.has(index) ? "action done" : "action"} key={index} onClick={() => toggle(index)}>
+                  <span className="check">{done.has(index) ? "✓" : index + 1}</span>
+                  <span className="due">{action.timing}</span>
+                  <span className="action-copy"><strong>{action.action}</strong><small>{action.reason}</small></span>
+                  <span className="arrow">→</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
 
       <aside className="insight-rail">
         <section className="team-card">
-          <div className="rail-heading"><div><span className="live-dot" />CASE TEAM</div><small>{runtime.orchestrator} · {runtime.provider}</small></div>
+          <div className="rail-heading"><div><span className="live-dot" />CASE TEAM</div></div>
           <div className="agent-list">
-            <div><span className="agent-avatar lead">CL</span><p><strong>Case lead</strong><small>Synthesized position</small></p><i>✓</i></div>
-            <div><span className="agent-avatar contract">CA</span><p><strong>Contract analyst</strong><small>Mapped 3 policy clauses</small></p><i>✓</i></div>
-            <div><span className="agent-avatar risk">RM</span><p><strong>Risk modeler</strong><small>Quantified exposure</small></p><i>✓</i></div>
-            <div><span className="agent-avatar writer">NW</span><p><strong>Negotiation writer</strong><small>Prepared 2 responses</small></p><i>✓</i></div>
-          </div>
-          <button onClick={() => notify("Analysis trace opened")}>View analysis trace <span>↗</span></button>
-        </section>
-
-        <section className="argument-card">
-          <div className="rail-heading"><div>ARGUMENT MAP</div><button onClick={() => goTo("Strategy")}>Open</button></div>
-          <div className="argument-flow">
-            <div className="their-position"><span>THEIR POSITION</span><p>Security hazard ≠ sea peril; extra costs excluded</p></div>
-            <div className="flow-arrow">↓</div>
-            <div className="our-pivot"><span>OUR PIVOT</span><p>Expense was necessary to avert insured physical loss</p></div>
-            <div className="flow-arrow">↓</div>
-            <div className="proof-needed"><span>PROOF NEEDED</span><p>Thermal thresholds + segregated mitigation costs</p></div>
+            {team.map((member) => (
+              <div key={member.role}>
+                <span className={`agent-avatar ${roleAvatarClass(member.role)}`}>{member.label.slice(0, 2).toUpperCase()}</span>
+                <p><strong>{member.label}</strong><small>{member.note}</small></p>
+                <i>{Math.round(member.confidence * 100)}%</i>
+              </div>
+            ))}
           </div>
         </section>
 
-        <section className="watch-card">
-          <span className="watch-icon">!</span>
-          <div><strong>Do not overstate certainty</strong><p>60–65°C is currently an estimate. Obtain a technical declaration before repeating it as fact.</p></div>
-        </section>
+        {analysis.evidenceGaps.length > 0 && (
+          <section className="argument-card">
+            <div className="rail-heading"><div>EVIDENCE GAPS</div></div>
+            <div className="argument-flow">
+              {analysis.evidenceGaps.slice(0, 3).map((gap, index) => (
+                <div className="proof-needed" key={index}><span>GAP {index + 1}</span><p>{gap}</p></div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {risks.length > 0 && (
+          <section className="watch-card">
+            <span className="watch-icon">!</span>
+            <div><strong>Risk flagged by the case team</strong><p>{risks[0]}</p></div>
+          </section>
+        )}
       </aside>
     </div>
   );
 }
 
 function Evidence({
-  notify,
   documents,
-  isStoredCase,
   onAddEvidence,
   uploading,
 }: {
-  notify: (m: string) => void;
   documents: StoredDocument[];
-  isStoredCase: boolean;
   onAddEvidence: (files: File[]) => void;
   uploading: boolean;
 }) {
@@ -631,46 +724,43 @@ function Evidence({
 
   return (
     <div className="evidence-view content-view single-column">
-      <div className="page-intro"><div><span className="section-kicker"><b>◇</b> EVIDENCE ROOM</span><h2>Every claim tied to its source.</h2><p>{isStoredCase ? "Original files remain downloadable while extracted text is available to the case team." : "Case facts were extracted, cross-checked, and separated from assumptions."}</p></div>{isStoredCase ? <label className={`evidence-upload ${uploading ? "disabled" : ""}`}><input type="file" multiple disabled={uploading} accept=".pdf,.docx,.xlsx,.csv,.txt,.md,.json,.xml,.html,.eml,.png,.jpg,.jpeg" onChange={(event) => { onAddEvidence(Array.from(event.target.files ?? [])); event.target.value = ""; }} />{uploading ? "Processing…" : "＋ Add evidence"}</label> : <button onClick={() => notify("Create a persisted case to add your own evidence")}>＋ Add evidence</button>}</div>
-      {isStoredCase && documents.length === 0 && <section className="stored-empty"><span>⇧</span><h3>No files in this case yet.</h3><p>Add the contracts, correspondence, invoices, or shipment records the case team should use.</p></section>}
-      {documents.length > 0 && <section className="stored-documents" aria-labelledby="stored-documents-title">
-        <div className="stored-documents-heading"><div><span>PERSISTED EVIDENCE</span><h3 id="stored-documents-title">Originals secured. Processing visible.</h3></div><small>{documents.length} FILE{documents.length === 1 ? "" : "S"}</small></div>
-        <div className="stored-document-list">
-          {documents.map((document) => <article key={document.id}>
-            <span className={`stored-status ${document.extractionStatus}`}>{document.extractionStatus === "ready" ? "✓" : document.extractionStatus === "failed" ? "!" : "•"}</span>
-            <div><strong>{document.originalName}</strong><small>{formatBytes(document.byteSize)} · {document.extractionStatus === "ready" ? `${document.extractedCharacters.toLocaleString()} characters extracted` : document.extractionError ?? "Original stored"}</small></div>
-            <code>{document.sha256.slice(0, 10)}</code>
-            <a href={document.downloadUrl}>Download ↓</a>
-          </article>)}
+      <div className="page-intro">
+        <div>
+          <span className="section-kicker"><b>◇</b> EVIDENCE ROOM</span>
+          <h2>Every claim tied to its source.</h2>
+          <p>Original files remain downloadable while extracted text is available to the case team.</p>
         </div>
-      </section>}
-      {isStoredCase ? <div className="evidence-summary">
-        <div><span>{documents.length}</span><p><strong>Originals persisted</strong><small>{formatBytes(storedBytes)} on durable storage</small></p></div>
-        <div><span>{ready}</span><p><strong>Text-ready files</strong><small>Available to the agent workflow</small></p></div>
-        <div><span>{needsAttention}</span><p><strong>Needs attention</strong><small>Unsupported, empty, or failed extraction</small></p></div>
-      </div> : <>
-      <div className="evidence-summary">
-        <div><span>36</span><p><strong>Verified facts</strong><small>Across 4 evidence groups</small></p></div>
-        <div><span>3</span><p><strong>Open questions</strong><small>Blocking confidence</small></p></div>
-        <div><span>1</span><p><strong>Unsupported claim</strong><small>Needs thermal proof</small></p></div>
+        <label className={`evidence-upload ${uploading ? "disabled" : ""}`}>
+          <input type="file" multiple disabled={uploading} accept=".pdf,.docx,.xlsx,.csv,.txt,.md,.json,.xml,.html,.eml,.png,.jpg,.jpeg" onChange={(event) => { onAddEvidence(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
+          {uploading ? "Processing…" : "＋ Add evidence"}
+        </label>
       </div>
-      <div className="evidence-cards">
-        {evidence.map((item) => <button key={item.title} onClick={() => notify(`${item.title}: ${item.facts} extracted facts`)}>
-          <span className={`doc-thumb ${item.color}`}><i /><i /><i /></span>
-          <span className="evidence-copy"><small>{item.type}</small><strong>{item.title}</strong><em>{item.meta}</em><p>{item.note}</p></span>
-          <span className="fact-count"><strong>{item.facts}</strong><small>FACTS</small></span>
-          <span className="card-arrow">→</span>
-        </button>)}
-      </div>
-      <section className="fact-table">
-        <div className="table-title"><div><span>CRITICAL FACTS</span><h3>What the strategy relies on</h3></div><button onClick={() => notify("Fact filters opened")}>Filter ▾</button></div>
-        <div className="fact-row head"><span>FACT</span><span>SOURCE</span><span>STATUS</span></div>
-        <div className="fact-row"><span>Contracted discharge port was Jeddah</span><span>Bills of lading</span><b>Verified</b></div>
-        <div className="fact-row"><span>8 containers discharged at Jazan on 16 + 25 June</span><span>Carrier correspondence</span><b>Verified</b></div>
-        <div className="fact-row"><span>Cargo may face irreversible damage at 60–65°C</span><span>Draft response only</span><b className="needs-proof">Needs proof</b></div>
-        <div className="fact-row"><span>Policy requires reasonable loss-prevention measures</span><span>CIC policy § IV(2)</span><b>Verified</b></div>
-      </section>
-      </>}
+      {documents.length === 0 ? (
+        <section className="stored-empty">
+          <span>⇧</span>
+          <h3>No files in this case yet.</h3>
+          <p>Add the contracts, correspondence, invoices, or shipment records the case team should use.</p>
+        </section>
+      ) : (
+        <>
+          <section className="stored-documents" aria-labelledby="stored-documents-title">
+            <div className="stored-documents-heading"><div><span>PERSISTED EVIDENCE</span><h3 id="stored-documents-title">Originals secured. Processing visible.</h3></div><small>{documents.length} FILE{documents.length === 1 ? "" : "S"}</small></div>
+            <div className="stored-document-list">
+              {documents.map((document) => <article key={document.id}>
+                <span className={`stored-status ${document.extractionStatus}`}>{document.extractionStatus === "ready" ? "✓" : document.extractionStatus === "failed" ? "!" : "•"}</span>
+                <div><strong>{document.originalName}</strong><small>{formatBytes(document.byteSize)} · {document.extractionStatus === "ready" ? `${document.extractedCharacters.toLocaleString()} characters extracted` : document.extractionError ?? "Original stored"}</small></div>
+                <code>{document.sha256.slice(0, 10)}</code>
+                <a href={document.downloadUrl}>Download ↓</a>
+              </article>)}
+            </div>
+          </section>
+          <div className="evidence-summary">
+            <div><span>{documents.length}</span><p><strong>Originals persisted</strong><small>{formatBytes(storedBytes)} on durable storage</small></p></div>
+            <div><span>{ready}</span><p><strong>Text-ready files</strong><small>Available to the agent workflow</small></p></div>
+            <div><span>{needsAttention}</span><p><strong>Needs attention</strong><small>Unsupported, empty, or failed extraction</small></p></div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -683,6 +773,7 @@ function formatBytes(bytes: number) {
 
 function formatCaseStatus(status: string) {
   const labels: Record<string, string> = {
+    intake: "Case created",
     analyzing: "Case team analyzing",
     evidence: "Evidence preserved",
     strategy: "Strategy ready",
@@ -691,50 +782,143 @@ function formatCaseStatus(status: string) {
   return labels[status] ?? "Workspace case";
 }
 
-function Strategy({ goTo }: { goTo: (v: View) => void }) {
+function Strategy({
+  analysis,
+  running,
+  onRun,
+  goTo,
+}: {
+  analysis: CaseAnalysis | null;
+  running: boolean;
+  onRun: () => void;
+  goTo: (v: View) => void;
+}) {
+  if (!analysis) {
+    return (
+      <div className="content-view single-column">
+        <EmptyState
+          icon="⌘"
+          title="No positions to compare yet."
+          body="Once the case team runs, you'll see the recommended position scored against every alternative it considered."
+          actionLabel={running ? "Analyzing…" : "Run case team"}
+          onAction={onRun}
+          actionDisabled={running}
+        />
+      </div>
+    );
+  }
+
+  const score = Math.round(analysis.confidence * 100);
+
   return (
     <div className="strategy-view content-view single-column">
-      <div className="page-intro"><div><span className="section-kicker"><b>⌘</b> POSITION DESIGN</span><h2>Three routes. One disciplined lead.</h2><p>Each path is scored against policy language, available evidence, counterparty stance, and recoverable value.</p></div><button className="solid" onClick={() => goTo("Drafts")}>Draft from strategy →</button></div>
-      <div className="strategy-routes">
-        {strategyRoutes.map((route) => <article className={`strategy-route ${route.tone}`} key={route.title}>
-          <div className="route-top"><span>{route.label}</span><div className="route-score"><strong>{route.score}</strong><small>/100</small></div></div>
-          <h3>{route.title}</h3><p>{route.description}</p>
-          <div className="score-bar"><i style={{ width: `${route.score}%` }} /></div>
-          <div className="route-tags">{route.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
-        </article>)}
+      <div className="page-intro">
+        <div>
+          <span className="section-kicker"><b>⌘</b> POSITION DESIGN</span>
+          <h2>The recommended position, and what else the team weighed.</h2>
+          <p>Scored by the case team against the evidence available when it ran.</p>
+        </div>
+        <button className="solid" onClick={() => goTo("Drafts")}>Draft from strategy →</button>
       </div>
+      <div className="strategy-routes">
+        <article className="strategy-route recommended">
+          <div className="route-top"><span>RECOMMENDED</span><div className="route-score"><strong>{score}</strong><small>/100</small></div></div>
+          <h3>{analysis.recommendedPosition}</h3>
+          <p>{analysis.executiveSummary}</p>
+          <div className="score-bar"><i style={{ width: `${score}%` }} /></div>
+        </article>
+        {analysis.alternatives.map((alternative, index) => (
+          <article className="strategy-route fallback" key={index}>
+            <div className="route-top"><span>ALTERNATIVE</span></div>
+            <h3>{alternative.name}</h3>
+            <p>{alternative.whenToUse}</p>
+            <div className="route-tags"><span>{alternative.tradeoffs}</span></div>
+          </article>
+        ))}
+      </div>
+
       <div className="strategy-lower">
-        <section className="concession-ladder"><div className="table-title"><div><span>CONCESSION LADDER</span><h3>Know the walk-down before replying</h3></div></div>
-          <div><span className="ladder-level l1">1</span><p><strong>Full preservation cost recovery</strong><small>Emergency extraction + handling + onward transit</small></p><b>OPEN</b></div>
-          <div><span className="ladder-level l2">2</span><p><strong>Costs directly tied to physical preservation</strong><small>Exclude ordinary storage and documentation fees</small></p><b>FALLBACK</b></div>
-          <div><span className="ladder-level l3">3</span><p><strong>Commercial cost share</strong><small>Without prejudice; preserve carrier recourse</small></p><b>FLOOR</b></div>
+        <section className="fact-table">
+          <div className="table-title"><div><span>EVIDENCE GAPS</span><h3>Close these before you commit</h3></div></div>
+          {analysis.evidenceGaps.length === 0 ? (
+            <div className="fact-row"><span>No open evidence gaps reported by the case team.</span><span /><span /></div>
+          ) : analysis.evidenceGaps.map((gap, index) => (
+            <div className="fact-row" key={index}><span>{gap}</span><span /><b className="needs-proof">Open</b></div>
+          ))}
         </section>
-        <section className="counterparty-card"><span>COUNTERPARTY READ</span><h3>Technically precise, procedurally open.</h3><p>The adjuster rejected one coverage theory but invited supporting documentation and kept both files active. Escalate through evidence, not rhetoric.</p><div><span>Likely objection</span><strong>“No insured physical damage occurred.”</strong></div><div><span>Prepared answer</span><strong>Mitigation expenses exist precisely because damage was prevented.</strong></div></section>
+        <section className="counterparty-card">
+          <span>TEAM READ</span>
+          <h3>How confident each specialist is.</h3>
+          <p>Confidence and risk count from each independent specialist pass.</p>
+          {analysis.specialistOutputs.map((specialist, index) => (
+            <div key={index}><span>{roleLabel(specialist.role)}</span><strong>{Math.round(specialist.confidence * 100)}% confidence · {specialist.risks.length} risk{specialist.risks.length === 1 ? "" : "s"} flagged</strong></div>
+          ))}
+        </section>
       </div>
     </div>
   );
 }
 
-function Drafts({ draft, setDraft, onCopy, notify }: { draft: string; setDraft: (v: string) => void; onCopy: () => void; notify: (m: string) => void }) {
+function Drafts({
+  analysis,
+  draft,
+  setDraft,
+  onCopy,
+  notify,
+  running,
+  onRun,
+}: {
+  analysis: CaseAnalysis | null;
+  draft: string;
+  setDraft: (v: string) => void;
+  onCopy: () => void;
+  notify: (m: string) => void;
+  running: boolean;
+  onRun: () => void;
+}) {
+  if (!analysis) {
+    return (
+      <div className="content-view single-column">
+        <EmptyState
+          icon="✎"
+          title="No draft yet."
+          body="A draft response is generated from the case team's approved strategy, with every factual claim checked against your evidence."
+          actionLabel={running ? "Analyzing…" : "Run case team"}
+          onAction={onRun}
+          actionDisabled={running}
+        />
+      </div>
+    );
+  }
+
+  const wordCount = draft.trim() ? draft.trim().split(/\s+/).length : 0;
+
   return (
     <div className="draft-view content-view">
-      <aside className="draft-list"><div className="draft-list-head"><span>2 DRAFTS</span><button onClick={() => notify("New draft started")}>＋</button></div><button className="active"><span className="draft-status">READY</span><strong>Coverage re-evaluation</strong><small>Formal · Evidence-led</small></button><button><span className="draft-status muted">OPTION</span><strong>Without-prejudice settlement</strong><small>Commercial · Concise</small></button></aside>
+      <aside className="draft-list">
+        <div className="draft-list-head"><span>1 DRAFT</span></div>
+        <button className="active"><span className="draft-status">READY</span><strong>Recommended response</strong><small>Generated from the approved strategy</small></button>
+      </aside>
       <section className="editor-card">
-        <header><div><span>FORMAL RESPONSE</span><h2>Coverage re-evaluation request</h2></div><div><button onClick={onCopy}>Copy</button><button className="send" onClick={() => notify("Export options opened")}>Export ↗</button></div></header>
-        <div className="draft-controls"><button>Formal ▾</button><button>Firm but collaborative ▾</button><span>Based on 12 cited facts</span></div>
+        <header>
+          <div><span>DRAFT RESPONSE</span><h2>Response drafted by the case team</h2></div>
+          <div><button onClick={onCopy}>Copy</button><button className="send" onClick={() => notify("Export options opened")}>Export ↗</button></div>
+        </header>
         <textarea aria-label="Draft response" value={draft} onChange={(e) => setDraft(e.target.value)} />
-        <footer><div><span className="quality-dot" />All factual claims checked</div><span>{draft.split(/\s+/).length} words</span></footer>
+        <footer><div><span className="quality-dot" />Drafted from the approved strategy</div><span>{wordCount} words</span></footer>
       </section>
-      <aside className="draft-guidance"><div className="rail-heading"><div>WRITER NOTES</div></div><div className="guidance-item good"><span>✓</span><p><strong>Strong framing</strong><small>Clearly separates mitigation expense from delay loss.</small></p></div><div className="guidance-item warning"><span>!</span><p><strong>Evidence gap</strong><small>Cite technical support before treating 60–65°C as established.</small></p></div><div className="guidance-item neutral"><span>→</span><p><strong>Suggested close</strong><small>Ask for agreement in principle before submitting the final cost schedule.</small></p></div><button onClick={() => notify("Draft refreshed with writer notes")}>✦ Apply suggestions</button></aside>
-    </div>
-  );
-}
-
-function WonCase({ onOpen }: { onOpen: () => void }) {
-  return (
-    <div className="won-view content-view single-column">
-      <section className="win-hero"><span className="win-badge">✓ NEGOTIATION WON</span><h2>$50,100 <em>recovered.</em></h2><p>A retrospective emergency surcharge was successfully challenged by anchoring the response to the agreed freight terms, the shipment timeline, and the correct insurance pathway.</p><div className="win-metrics"><div><strong>14 × 20′</strong><span>containers protected</span></div><div><strong>100%</strong><span>target recovery</span></div><div><strong>Closed</strong><span>August 2026</span></div></div></section>
-      <div className="outcome-grid"><section><span className="section-kicker"><b>↗</b> WHAT WORKED</span><h3>The outcome became a reusable playbook.</h3><div className="learning"><span>01</span><p><strong>Separate contractual exposure</strong><small>The fixed-freight agreement was tested before engaging with the carrier’s broad advisory.</small></p></div><div className="learning"><span>02</span><p><strong>Route the loss correctly</strong><small>Cargo interruption costs were prepared as an insurance recovery, not conceded as freight.</small></p></div><div className="learning"><span>03</span><p><strong>Pre-empt rejection grounds</strong><small>The claim package addressed predictable insurer objections before they were raised.</small></p></div></section><section className="playbook-card"><div><span>NEW PLAYBOOK</span><b>LEARNED FROM THIS CASE</b></div><h3>Retrospective carrier surcharge defense</h3><p>Ready to reuse whenever a carrier applies a mid-voyage emergency or operational cost charge.</p><ul><li>Contract classification check</li><li>Effective-date and “cargo afloat” test</li><li>Carrier vs. insurer recovery map</li><li>Reservation-of-rights response</li></ul><button onClick={onOpen}>Use on active case <span>→</span></button></section></div>
+      <aside className="draft-guidance">
+        <div className="rail-heading"><div>WRITER NOTES</div></div>
+        {analysis.evidenceGaps.slice(0, 2).map((gap, index) => (
+          <div className="guidance-item warning" key={`gap-${index}`}><span>!</span><p><strong>Evidence gap</strong><small>{gap}</small></p></div>
+        ))}
+        {analysis.priorityActions[0] && (
+          <div className="guidance-item neutral"><span>→</span><p><strong>Suggested next step</strong><small>{analysis.priorityActions[0].action}</small></p></div>
+        )}
+        {analysis.evidenceGaps.length === 0 && (
+          <div className="guidance-item good"><span>✓</span><p><strong>No open evidence gaps</strong><small>The case team did not flag anything unresolved.</small></p></div>
+        )}
+      </aside>
     </div>
   );
 }

@@ -21,7 +21,7 @@ LangGraph controls the workflow. LangChain's common chat-model interface keeps t
 - Anthropic/Claude through `@langchain/anthropic`
 - Any sufficiently OpenAI-compatible endpoint through a custom base URL
 
-The browser never receives provider keys. Better Auth handles Google OAuth, Drizzle stores users, sessions, cases, extracted document text, and run results in PostgreSQL, and originals are persisted on an attached Railway Volume. Access can be public to any Google account or restricted by email allowlist.
+The browser never receives provider keys. Better Auth handles email-and-password sign-up and sign-in, Drizzle stores users, sessions, cases, extracted document text, and run results in PostgreSQL, and originals are persisted on an attached Railway Volume. Access can be public to anyone who creates an account or restricted by email allowlist.
 
 ## Current implementation
 
@@ -30,7 +30,7 @@ The browser never receives provider keys. Better Auth handles Google OAuth, Driz
 - Durable case and document APIs with ownership checks, SHA-256 checksums, authenticated downloads, and reloadable case history
 - Original-file storage on a Railway Volume (or `.data` locally) plus PDF, DOCX, XLSX, CSV, text, Markdown, JSON, XML, HTML, and EML extraction
 - Runtime status at `GET /api/runtime`; it exposes provider/model names but never credentials
-- Better Auth Google sign-in at `/sign-in`
+- Better Auth email-and-password sign-up (`/sign-up`) and sign-in (`/sign-in`)
 - PostgreSQL schema and Drizzle migrations for users, sessions, cases, documents, and agent runs
 - Docker and config-as-code deployment for Railway
 - Liveness check at `GET /api/health`
@@ -48,7 +48,7 @@ npm run db:migrate
 npm run dev
 ```
 
-Open `http://localhost:3000`. Authentication is off by default for local UI development. Set `AUTH_ENABLED=true` only after PostgreSQL and Google OAuth are configured.
+Open `http://localhost:3000`. Authentication is off by default for local UI development. Set `AUTH_ENABLED=true` once PostgreSQL is configured to require a real account (email + password) on `/sign-up`.
 
 ### Choose the model provider
 

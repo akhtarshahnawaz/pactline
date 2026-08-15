@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return Response.json({
     ...getSafeRuntimeDescriptor(),
-    authentication: isAuthenticationEnabled ? "Google" : "Disabled for local setup",
+    authentication: isAuthenticationEnabled ? "email" : "Disabled for local setup",
     access: accessMode,
   });
 }

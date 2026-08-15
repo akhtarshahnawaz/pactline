@@ -12,10 +12,11 @@ export default function PrivacyPage() {
 
         <h2>What the workspace stores</h2>
         <p>
-          Pactline stores the name, email address, and profile image supplied by
-          Google at sign-in; case titles and descriptions; original uploaded
-          files; extracted document text and processing metadata; and completed
-          case-analysis results.
+          Pactline stores the name, email address, and a securely hashed
+          password you provide when creating an account (the plain-text
+          password itself is never stored); case titles and descriptions;
+          original uploaded files; extracted document text and processing
+          metadata; and completed case-analysis results.
         </p>
 
         <h2>Why the data is processed</h2>
@@ -38,8 +39,7 @@ export default function PrivacyPage() {
         <p>
           This prototype retains case material until the workspace operator
           deletes it or applies a retention policy. You may ask the operator for
-          access, correction, export, or deletion. Google sign-in can also be
-          disconnected from your Google Account settings.
+          access, correction, export, or deletion of your account and data.
         </p>
 
         <h2>Important limitation</h2>

@@ -6,22 +6,32 @@ import { useState } from "react";
 
 import { authClient } from "@/lib/auth-client";
 
-export default function SignInPage() {
+export default function SignUpPage() {
   const router = useRouter();
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  async function signIn(event: React.FormEvent) {
+  async function signUp(event: React.FormEvent) {
     event.preventDefault();
-    setLoading(true);
     setError("");
 
-    const result = await authClient.signIn.email({ email, password });
+    if (password.length < 8) {
+      setError("Use a password with at least 8 characters.");
+      return;
+    }
+
+    setLoading(true);
+    const result = await authClient.signUp.email({
+      name: name.trim() || email.trim(),
+      email: email.trim(),
+      password,
+    });
 
     if (result.error) {
-      setError(result.error.message || "Sign-in failed. Check your email and password.");
+      setError(result.error.message || "The account could not be created.");
       setLoading(false);
       return;
     }
@@ -32,16 +42,27 @@ export default function SignInPage() {
 
   return (
     <main className="sign-in-shell">
-      <section className="sign-in-card" aria-labelledby="sign-in-title">
+      <section className="sign-in-card" aria-labelledby="sign-up-title">
         <div className="sign-in-brand" aria-hidden="true">
           P
         </div>
         <p className="sign-in-eyebrow">PACTLINE WORKSPACE</p>
-        <h1 id="sign-in-title">Welcome back.</h1>
+        <h1 id="sign-up-title">Create your workspace.</h1>
         <p className="sign-in-copy">
-          Sign in to your supply-chain decision workspace.
+          Set up your account to start building evidence-led negotiation cases.
         </p>
-        <form className="auth-form" onSubmit={signIn}>
+        <form className="auth-form" onSubmit={signUp}>
+          <label className="field-label" htmlFor="name">NAME</label>
+          <input
+            id="name"
+            type="text"
+            autoComplete="name"
+            required
+            className="case-title-input"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Jordan Lee"
+          />
           <label className="field-label" htmlFor="email">EMAIL</label>
           <input
             id="email"
@@ -57,20 +78,21 @@ export default function SignInPage() {
           <input
             id="password"
             type="password"
-            autoComplete="current-password"
+            autoComplete="new-password"
             required
+            minLength={8}
             className="case-title-input"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
-            placeholder="••••••••"
+            placeholder="At least 8 characters"
           />
           <button className="auth-button auth-submit" type="submit" disabled={loading}>
-            {loading ? "Signing in…" : "Sign in"}
+            {loading ? "Creating account…" : "Create account"}
           </button>
         </form>
         {error ? <p className="sign-in-error">{error}</p> : null}
         <p className="sign-in-note">
-          New to Pactline? <Link href="/sign-up">Create a workspace account</Link>.
+          Already have a workspace? <Link href="/sign-in">Sign in</Link>.
           By continuing, you agree to the workspace&apos;s <Link href="/privacy">privacy notice</Link>.
         </p>
       </section>
